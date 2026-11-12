@@ -1,0 +1,42 @@
+/// Backend API base URL, supplied at build time.
+///
+/// Set it in env.json (copy env.example.json) and build with:
+///
+///   flutter run --dart-define-from-file=env.json
+///
+/// Which address to use:
+///  - Android emulator:  http://10.0.2.2:8000   — the emulator's alias for the
+///    host machine's localhost. This is the default, so a fresh clone running
+///    on an emulator works with no configuration.
+///  - Physical device:   `http://<your PC's LAN IP>:8000`, e.g.
+///    http://192.168.1.20:8000. The phone and the PC must be on the same
+///    network, and the address must be listed in
+///    android/app/src/main/res/xml/network_security_config.xml — Android
+///    blocks cleartext HTTP to anything not named there.
+///  - Deployed backend:  https://... — no config entry needed, because HTTPS
+///    is permitted by default.
+class ApiConfig {
+  ApiConfig._();
+
+  static const String baseUrl = String.fromEnvironment(
+    'REPLIT_API_BASE',
+    defaultValue: 'http://10.0.2.2:8000',
+  );
+
+  /// Just the host, for showing a person which server their build talks to.
+  ///
+  /// Worth surfacing because the address is baked in at build time: a tester
+  /// holding an older APK cannot tell, and neither can anyone helping them. A
+  /// build once shipped pointing at `onrender.co` instead of `onrender.com` —
+  /// someone else's domain, which answered with a redirect — and the app could
+  /// only say that it could not reach the server.
+  static String get host => Uri.parse(baseUrl).host;
+
+  /// The public affiliation form, in the Admin console: an organisation (a
+  /// fire brigade, a barangay) applies to join RepLiT there. "Want to be an
+  /// affiliate? REGISTER HERE" on the sign-in screen opens it.
+  static const String affiliateRegisterUrl = String.fromEnvironment(
+    'REPLIT_AFFILIATE_REGISTER',
+    defaultValue: 'https://replit-backend-5u9u.vercel.app/register',
+  );
+}

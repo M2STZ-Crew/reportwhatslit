@@ -1,0 +1,1524 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../models/field_ops.dart';
+import 'api_config.dart';
+import 'phone_gate.dart';
+import 'session.dart';
+import '../i18n/i18n.dart';
+
+class ApiException implements Exception {
+  ApiException(this.statusCode, this.message, {this.code, this.details});
+  final int statusCode;
+  final String message;
+
+  /// The backend's machine-readable `error` (e.g. `phone_code_cooldown`), when
+  /// it sent one. Screens branch on this, never on the wording of [message].
+  final String? code;
+
+  /// The backend's `details` object, e.g. `{retry_after_seconds: 42}`.
+  final Map<String, dynamic>? details;
+
+  @override
+  String toString() => message;
+}
+
+/// The stored session is over and could not be renewed: sign in again.
+///
+/// Distinct from a plain 401 so screens can tell "your session expired" from
+/// "the network is down" and react differently. A retry cannot fix this one —
+/// only signing in can — so anything that catches it should send the user to
+/// the login screen rather than offering a button that will fail again.
+/// The account's organisation is suspended or revoked (backend v1.12.28):
+/// say so where the account would have loaded, not "could not load".
+bool frozenOrganization(Object e) =>
+    e is ApiException &&
+    (e.code == 'organization_suspended' || e.code == 'organization_revoked');
+
+class SessionExpiredException extends ApiException {
+  SessionExpiredException()
+    : super(401, t('Your session has ended. Please sign in again.'));
+}
+
+class ApiClient {
+  ApiClient({http.Client? client}) : _raw = client ?? http.Client();
+
+  /// The bare connection; the session refresh goes over it.
+  final http.Client _raw;
+
+  /// Every other request goes over this one: a lapsed access token is renewed
+  /// and the request replayed, whichever call it was ([_RenewingClient]).
+  late final http.Client _client = _RenewingClient(_raw, _refreshSession);
+
+  /// The account was signed in on another phone (backend v1.12.27,
+  /// app/services/one_device.py: the newest sign-in wins). main.dart sets
+  /// this to put up the warning and Exit; it is called once per sign-in.
+  static void Function()? onSignedInElsewhere;
+  static bool _toldElsewhere = false;
+
+  /// A response said `signed_in_elsewhere`: tell the app, once.
+  static void signedInElsewhere() {
+    if (_toldElsewhere) return;
+    _toldElsewhere = true;
+    onSignedInElsewhere?.call();
+  }
+
+  /// A new sign-in on this phone: the next refusal is news again.
+  static void signedInHere() => _toldElsewhere = false;
+
+  /// A refresh already under way, shared by every caller that hits a 401.
+  static Future<bool>? _refreshing;
+
+  /// How long signing in waits for the server. The server sleeps after a
+  /// quiet spell and takes about half a minute to wake (measured 32 s on 31
+  /// Oct 2026, against under a second awake), so this has to outlast that.
+  static const Duration signInTimeout = Duration(seconds: 75);
+
+  /// How long a sign-in spins before the screen says why it is taking so long.
+  static const Duration slowAfter = Duration(seconds: 6);
+
+  /// Start waking the server, before anyone needs it. Best-effort: the
+  /// request that matters still waits for it.
+  Future<void> wakeServer() async {
+    try {
+      await _raw
+          .get(Uri.parse('${ApiConfig.baseUrl}/health'))
+          .timeout(signInTimeout);
+    } catch (_) {
+      // No signal, or a server still waking: nothing to tell anyone yet.
+    }
+  }
+
+  /// Sign in with an email or a mobile number, and the password.
+  ///
+  /// A number works only once it is verified on the account; staff, who have
+  /// none, keep signing in by email.
+  Future<void> login({
+    String? email,
+    String? phone,
+    required String password,
+  }) async {
+    final uri = Uri.parse('${ApiConfig.baseUrl}/auth/login');
+    final resp = await _client
+        .post(
+          uri,
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'email': ?email,
+            'phone': ?phone,
+            'password': password,
+          }),
+        )
+        .timeout(signInTimeout);
+    _storeSession(_decode(resp));
+    signedInHere();
+  }
+
+  Future<void> signup({
+    required String email,
+    required String password,
+    required String fullName,
+    String? mobile,
+    String? dateOfBirth, // ISO yyyy-MM-dd
+    String? gender,
+  }) async {
+    final uri = Uri.parse('${ApiConfig.baseUrl}/auth/signup');
+    final resp = await _client.post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'email': email,
+        'password': password,
+        'full_name': fullName,
+        'mobile': ?mobile,
+        'date_of_birth': ?dateOfBirth,
+        'gender': ?gender,
+      }),
+    );
+    _storeSession(_decode(resp));
+    signedInHere();
+  }
+
+  /// Update the caller's editable profile fields: PATCH /auth/me/profile.
+  /// Returns the refreshed /auth/me-shaped profile.
+  Future<Map<String, dynamic>> updateProfile({
+    String? fullName,
+    String? mobile,
+    String? dateOfBirth, // ISO yyyy-MM-dd
+    String? gender,
+  }) async {
+    final resp = await _client.patch(
+      Uri.parse('${ApiConfig.baseUrl}/auth/me/profile'),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+      },
+      body: jsonEncode({
+        'full_name': ?fullName,
+        'mobile': ?mobile,
+        'date_of_birth': ?dateOfBirth,
+        'gender': ?gender,
+      }),
+    );
+    return _decode(resp);
+  }
+
+  /// Request a password-reset email (public): POST /auth/recover.
+  Future<String> requestPasswordReset(String email) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/auth/recover'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'email': email}),
+    );
+    final body = _decode(resp);
+    return (body['message'] as String?) ??
+        t('If that email is registered, a reset link has been sent.');
+  }
+
+  /// The caller's in-app notification inbox (newest first): GET /notifications.
+  Future<List<dynamic>> getNotifications() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/notifications'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load notifications.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// Unread-notification count for the bell badge: GET /notifications/unread-count.
+  Future<int> getUnreadNotificationCount() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/notifications/unread-count'),
+      headers: _auth,
+    );
+    final body = _decode(resp);
+    return (body['count'] as num?)?.toInt() ?? 0;
+  }
+
+  /// Mark all the caller's notifications read: POST /notifications/read-all.
+  Future<void> markAllNotificationsRead() async {
+    try {
+      await _client.post(
+        Uri.parse('${ApiConfig.baseUrl}/notifications/read-all'),
+        headers: _auth,
+      );
+    } catch (_) {
+      // best-effort
+    }
+  }
+
+  /// Mark one notification read: POST /notifications/{id}/read.
+  Future<void> markNotificationRead(String id) async {
+    try {
+      await _client.post(
+        Uri.parse('${ApiConfig.baseUrl}/notifications/$id/read'),
+        headers: _auth,
+      );
+    } catch (_) {
+      // best-effort
+    }
+  }
+
+  /// Send a test push to the caller's registered devices: POST /devices/test.
+  Future<String> sendTestPush() async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/devices/test'),
+      headers: {
+        'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+      },
+    );
+    final body = _decode(resp);
+    return (body['message'] as String?) ?? t('Test notification sent.');
+  }
+
+  /// Submit an incident report (multipart): photo + device GPS + agencies + notes.
+  Future<Map<String, dynamic>> submitReport({
+    required double lat,
+    required double lng,
+    double? accuracyM,
+    required List<String> agencies,
+    String? notes,
+    required List<int> photoBytes,
+    String photoFilename = 'sos.jpg',
+  }) async {
+    final uri = Uri.parse('${ApiConfig.baseUrl}/reports/submit');
+    final request = http.MultipartRequest('POST', uri)
+      ..headers['Authorization'] =
+          'Bearer ${Session.instance.accessToken ?? ''}'
+      ..fields['device_lat'] = lat.toString()
+      ..fields['device_lng'] = lng.toString()
+      ..fields['selected_agencies'] = agencies.join(',');
+    if (accuracyM != null) {
+      request.fields['device_gps_accuracy_m'] = accuracyM.toString();
+    }
+    if (notes != null && notes.isNotEmpty) request.fields['notes'] = notes;
+    request.files.add(
+      http.MultipartFile.fromBytes(
+        'photo',
+        photoBytes,
+        filename: photoFilename,
+        contentType: MediaType('image', 'jpeg'),
+      ),
+    );
+    // Through the shared client (not request.send(), which opens a new one):
+    // the connection is reused, and a test can stand in for the server.
+    final streamed = await _client.send(request);
+    final resp = await http.Response.fromStream(streamed);
+    return _decode(resp);
+  }
+
+  /// Read one incident area (citizen-accessible): GET /areas/{id}.
+  Future<Map<String, dynamic>> getArea(String areaId) async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/areas/$areaId'),
+      headers: {
+        'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+      },
+    );
+    return _decode(resp);
+  }
+
+  /// Track It Live for an incident the caller reported: GET /areas/{id}/tracking.
+  ///
+  /// The same snapshot the `track:<id>` socket channel pushes — status, the
+  /// incident's position, and each responding unit's label and position. The
+  /// socket is the normal source; this is the first read and the fallback
+  /// while the socket is down. 403 for anyone who did not report it.
+  Future<Map<String, dynamic>> getTracking(String areaId) async {
+    final resp = await _authed(
+      () => _client.get(
+        Uri.parse('${ApiConfig.baseUrl}/areas/$areaId/tracking'),
+        headers: _auth,
+      ),
+    );
+    return _decode(resp);
+  }
+
+  /// List evacuation sites (citizen-accessible): GET /map/evacuation-sites.
+  Future<List<dynamic>> getEvacuationSites() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/map/evacuation-sites'),
+      headers: {
+        'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+      },
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(
+        resp.statusCode,
+        t('Failed to load evacuation sites.'),
+      );
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// List incident areas (citizen-accessible): GET /areas.
+  ///
+  /// Citizens use /areas (not the staff-only /incidents feed). Each item has
+  /// centroid_lat/centroid_lng, designation, status, report_count, etc. Pass
+  /// activeOnly: false to also include resolved/rejected areas.
+  Future<List<dynamic>> getAreas({bool activeOnly = true}) async {
+    final query = activeOnly ? '' : '?active_only=false';
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/areas$query'),
+      headers: {
+        'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+      },
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load incident areas.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// Add responder agencies to an incident you already reported:
+  /// POST /areas/{areaId}/request-agencies. Returns the merged agency list.
+  Future<Map<String, dynamic>> requestAreaAgencies(
+    String areaId,
+    List<String> agencies,
+  ) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/areas/$areaId/request-agencies'),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+      },
+      body: jsonEncode({'agencies': agencies}),
+    );
+    return _decode(resp);
+  }
+
+  /// Current user profile + verification status: GET /auth/me.
+  ///
+  /// Returns role, full_name, email, phone, verified_percent (0–100), and badge
+  /// (yellow | light_green | green | green_check).
+  Future<Map<String, dynamic>> getMe() async {
+    final resp = await _authed(
+      () => _client.get(
+        Uri.parse('${ApiConfig.baseUrl}/auth/me'),
+        headers: _auth,
+      ),
+    );
+    return _decode(resp);
+  }
+
+  /// Progressive verification, per channel: GET /verification/status.
+  /// `{verified_percent, badge, channels: [{type, status, ...}]}` — the only
+  /// way to tell "never submitted" from "submitted, awaiting review".
+  Future<Map<String, dynamic>> getVerificationStatus() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/verification/status'),
+      headers: {
+        'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+      },
+    );
+    return _decode(resp);
+  }
+
+  /// The caller's own reports with signed media URLs: GET /reports/mine.
+  Future<List<dynamic>> getMyReports() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/reports/mine'),
+      headers: {
+        'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+      },
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load your reports.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// The caller's answer to a 100 m alert, and whether "I am safe" is open to
+  /// them: GET /notifications/respond/{areaId}.
+  Future<Map<String, dynamic>> getAlertAnswer(String areaId) async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/notifications/respond/$areaId'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  /// Respond to a 100 m neighborhood alert: POST /notifications/respond.
+  /// [response] is 'report' (confirm a fire nearby), 'ignore' (dismiss) or
+  /// 'safe' (the resident says they are safe). Throws [ApiException] when the
+  /// server did not record it — then the alerts for this Area keep coming, and
+  /// the screen must not say otherwise.
+  Future<void> respondToAlert(String areaId, String response) async {
+    final http.Response resp;
+    try {
+      resp = await _client.post(
+        Uri.parse('${ApiConfig.baseUrl}/notifications/respond'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+        },
+        body: jsonEncode({'area_id': areaId, 'response': response}),
+      );
+    } catch (_) {
+      throw ApiException(0, t('Could not reach the server.'));
+    }
+    if (resp.statusCode >= 500) {
+      throw ApiException(resp.statusCode, t('Your answer was not recorded.'));
+    }
+    // A refusal says why ("This fire is over"); the screen shows it.
+    _decode(resp);
+  }
+
+  /// Register/refresh this device's FCM token: POST /devices.
+  Future<void> registerDevice({
+    required String fcmToken,
+    String platform = 'android',
+    String? deviceName,
+    String? appVersion,
+  }) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/devices'),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+      },
+      body: jsonEncode({
+        'fcm_token': fcmToken,
+        'platform': platform,
+        'device_name': ?deviceName,
+        'app_version': ?appVersion,
+      }),
+    );
+    _decode(resp);
+  }
+
+  /// Unregister an FCM token: DELETE /devices/{token} (best-effort).
+  Future<void> unregisterDevice(String fcmToken) async {
+    try {
+      await _client.delete(
+        Uri.parse('${ApiConfig.baseUrl}/devices/$fcmToken'),
+        headers: {
+          'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+        },
+      );
+    } catch (_) {
+      // ignore — local token is cleared regardless
+    }
+  }
+
+  /// Update the caller's last-known location: POST /auth/me/location.
+  ///
+  /// Sets users.location so the 100 m neighborhood-alert worker can reach this
+  /// device. Best-effort — a failure must not block the app.
+  Future<void> updateMyLocation(double lat, double lng) async {
+    try {
+      await _client.post(
+        Uri.parse('${ApiConfig.baseUrl}/auth/me/location'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+        },
+        body: jsonEncode({'latitude': lat, 'longitude': lng}),
+      );
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  /// The language the resident reads RepLiT in, so the alerts they get come
+  /// in it too: PUT /auth/me/language ('en' or 'tl').
+  Future<void> setLanguage(String code) async {
+    final resp = await _client.put(
+      Uri.parse('${ApiConfig.baseUrl}/auth/me/language'),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+      },
+      body: jsonEncode({'language': code}),
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Could not save the language.'));
+    }
+  }
+
+  /// A new password, given the current one: POST /auth/me/password
+  /// (WHAT'S NEXT, 1.2). Every other phone and browser is signed out; this
+  /// session stays. A wrong current password is a 400 `wrong_password` (never
+  /// a 401, which would read as an expired session), the same password again
+  /// `same_password`, and a new one outside 8–128 characters a 422.
+  Future<void> changePassword({
+    required String current,
+    required String next,
+  }) async {
+    final resp = await _authed(
+      () => _client.post(
+        Uri.parse('${ApiConfig.baseUrl}/auth/me/password'),
+        headers: _jsonAuth,
+        body: jsonEncode({'current_password': current, 'new_password': next}),
+      ),
+    );
+    _decode(resp);
+  }
+
+  /// Revoke the current session server-side: POST /auth/logout (best-effort).
+  Future<void> logout() async {
+    try {
+      await _client.post(
+        Uri.parse('${ApiConfig.baseUrl}/auth/logout'),
+        headers: {
+          'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+        },
+      );
+    } catch (_) {
+      // Ignore — the local session is cleared regardless.
+    }
+  }
+
+  // ----------------------------------------------------------------- //
+  // Progressive verification (Phase 4)
+  // ----------------------------------------------------------------- //
+
+  /// Email verification (+10%): POST /verification/email/request.
+  ///
+  /// Emails a one-time link that confirms the account's address when opened
+  /// (in Gmail, say); GET /verification/status then shows the email verified.
+  /// Returns {message, email, sent, expires_in_seconds, resend_after_seconds};
+  /// `sent` is false when the address is already confirmed. A 429 carries
+  /// `details.retry_after_seconds`: the wait between links
+  /// (`email_link_cooldown`) or the day's links spent
+  /// (`email_link_daily_limit`). A backend before 1.12.22 answers {message}.
+  Future<Map<String, dynamic>> requestEmailLink() async {
+    final resp = await _authed(
+      () => _client.post(
+        Uri.parse('${ApiConfig.baseUrl}/verification/email/request'),
+        headers: {
+          'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+        },
+      ),
+    );
+    return _decode(resp);
+  }
+
+  /// Phone OTP step 1: POST /verification/phone/request.
+  ///
+  /// The number may be typed any usual way (0917 123 4567, +63 917…); the
+  /// server normalises it. Returns {message, phone, sent, expires_in_seconds,
+  /// resend_after_seconds}. `sent` is false when the number is already
+  /// verified on this account. A 429 carries `details.retry_after_seconds`.
+  Future<Map<String, dynamic>> requestPhoneOtp(String phone) async {
+    final resp = await _authed(
+      () => _client.post(
+        Uri.parse('${ApiConfig.baseUrl}/verification/phone/request'),
+        headers: _jsonAuth,
+        body: jsonEncode({'phone': phone}),
+      ),
+    );
+    return _decode(resp);
+  }
+
+  /// Phone OTP (+40%) step 2: POST /verification/phone/verify.
+  ///
+  /// Returns {verified, verified_percent, badge, message}.
+  Future<Map<String, dynamic>> verifyPhoneOtp(String code) async {
+    final resp = await _authed(
+      () => _client.post(
+        Uri.parse('${ApiConfig.baseUrl}/verification/phone/verify'),
+        headers: _jsonAuth,
+        body: jsonEncode({'code': code}),
+      ),
+    );
+    return _decode(resp);
+  }
+
+  /// National ID (+50%) manual path: POST /verification/national-id/manual.
+  ///
+  /// Uploads an ID photo, its QR code and a matching selfie for Admin review,
+  /// with the holder's consent to PhilSys Check. The +50% is awarded once an
+  /// admin approves. Returns {verified, verified_percent, ...}.
+  Future<Map<String, dynamic>> submitNationalIdManual({
+    required List<int> idBytes,
+    required List<int> qrBytes,
+    required List<int> selfieBytes,
+    String idFilename = 'national_id.jpg',
+    String qrFilename = 'national_id_qr.jpg',
+    String selfieFilename = 'selfie.jpg',
+  }) async {
+    final uri = Uri.parse(
+      '${ApiConfig.baseUrl}/verification/national-id/manual',
+    );
+    final request = http.MultipartRequest('POST', uri)
+      ..headers['Authorization'] =
+          'Bearer ${Session.instance.accessToken ?? ''}'
+      ..fields['philsys_consent'] = 'true';
+    request.files.add(
+      http.MultipartFile.fromBytes(
+        'id_image',
+        idBytes,
+        filename: idFilename,
+        contentType: MediaType('image', 'jpeg'),
+      ),
+    );
+    request.files.add(
+      http.MultipartFile.fromBytes(
+        'selfie_image',
+        selfieBytes,
+        filename: selfieFilename,
+        contentType: MediaType('image', 'jpeg'),
+      ),
+    );
+    request.files.add(
+      http.MultipartFile.fromBytes(
+        'qr_image',
+        qrBytes,
+        filename: qrFilename,
+        contentType: MediaType('image', 'jpeg'),
+      ),
+    );
+    final streamed = await _client.send(request);
+    final resp = await http.Response.fromStream(streamed);
+    return _decode(resp);
+  }
+
+  // ----------------------------------------------------------------- //
+  // Responder / staff incidents (response_team console)
+  // ----------------------------------------------------------------- //
+
+  Map<String, String> get _auth => {
+    'Authorization': 'Bearer ${Session.instance.accessToken ?? ''}',
+  };
+
+  Map<String, String> get _jsonAuth => {
+    'Content-Type': 'application/json',
+    ..._auth,
+  };
+
+  /// List incidents visible to the caller's agency: GET /incidents.
+  ///
+  /// [status] filters to one area_status; pass activeOnly: false with it for a
+  /// status that is off the live feed (e.g. 'post_incident_report').
+  Future<List<dynamic>> getIncidents({
+    bool activeOnly = true,
+    String? status,
+  }) async {
+    final query = Uri(
+      queryParameters: {
+        if (!activeOnly) 'active_only': 'false',
+        'status': ?status,
+      },
+    ).query;
+    final resp = await _client.get(
+      Uri.parse(
+        '${ApiConfig.baseUrl}/incidents${query.isEmpty ? '' : '?$query'}',
+      ),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load incidents.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// One incident with reports + lifecycle: GET /incidents/{id}.
+  Future<Map<String, dynamic>> getIncident(String id) async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  /// Respond — "I am going": POST /incidents/{id}/self-dispatch (v12 §2.5.2).
+  ///
+  /// Open to responders and to Fire Volunteer / BFP coordinators once an
+  /// incident is verified. The first to respond puts it On the way; responding
+  /// twice to the same incident is refused (409).
+  ///
+  /// [vehicleName] is the unit they are going on — the coordinator's Accept
+  /// sheet picks it. A label on the response (the citizen's tracking card
+  /// shows it); a server without the field simply ignores it.
+  Future<Map<String, dynamic>> selfDispatch(
+    String id, {
+    String? notes,
+    String? vehicleName,
+  }) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/self-dispatch'),
+      headers: _jsonAuth,
+      body: jsonEncode({'notes': ?notes, 'vehicle_name': ?vehicleName}),
+    );
+    return _decode(resp);
+  }
+
+  /// Response team members, for the Post-Incident Report roster picker:
+  /// GET /incidents/{id}/available-responders. Each item has full_name,
+  /// agency_type, organization_id, is_busy, on_this_incident.
+  ///
+  /// v11 removed manual dispatch, so this no longer feeds a dispatch screen —
+  /// it feeds "who actually went", filed afterwards (§2.5.3).
+  Future<List<dynamic>> getAvailableResponders(String id) async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/available-responders'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load responders.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  // v11 removed manual dispatch (§2.5): choosing a truck and a crew while the
+  // incident was live was the paperwork that slowed the response down. The
+  // truck, driver and roster are recorded afterwards on the Post-Incident
+  // Report instead.
+
+  /// List the caller's organization equipment (fleet): GET /equipment.
+  Future<List<dynamic>> getEquipment() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/equipment'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load equipment.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// List active fire codes (FC-1..FC-8): GET /fire-codes.
+  Future<List<dynamic>> getFireCodes() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/fire-codes'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load fire codes.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// Press / broadcast a fire code to the incident's units: POST
+  /// /fire-codes/{codeId}/press.
+  Future<Map<String, dynamic>> pressFireCode(
+    String codeId, {
+    String? areaId,
+    String? notes,
+  }) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/fire-codes/$codeId/press'),
+      headers: _jsonAuth,
+      body: jsonEncode({'area_id': ?areaId, 'notes': ?notes}),
+    );
+    return _decode(resp);
+  }
+
+  /// Raise an alarm-escalation request to BFP: POST /alarm-requests.
+  Future<Map<String, dynamic>> createAlarmRequest({
+    required String areaId,
+    required String alarmLevel,
+    String? justification,
+  }) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/alarm-requests'),
+      headers: _jsonAuth,
+      body: jsonEncode({
+        'area_id': areaId,
+        'requested_alarm_level': alarmLevel,
+        'justification': ?justification,
+      }),
+    );
+    return _decode(resp);
+  }
+
+  /// List alarm requests for review (BFP sub-admin/admin): GET /alarm-requests.
+  /// Pass [status] (e.g. 'pending') or [areaId] to filter. Each item carries
+  /// the Area (designation, status, alarm level now, centre), who asked and
+  /// for which organisation, and who answered.
+  Future<List<dynamic>> getAlarmRequests({String? status, String? areaId}) =>
+      _alarmRequests('', {'status': ?status, 'area_id': ?areaId});
+
+  /// The caller's own alarm requests, newest first: GET /alarm-requests/mine.
+  /// Pass [areaId] for one Area's.
+  Future<List<dynamic>> getMyAlarmRequests({String? areaId}) =>
+      _alarmRequests('/mine', {'area_id': ?areaId});
+
+  Future<List<dynamic>> _alarmRequests(
+    String path,
+    Map<String, String> filters,
+  ) async {
+    final query = Uri(queryParameters: filters).query;
+    final resp = await _client.get(
+      Uri.parse(
+        '${ApiConfig.baseUrl}/alarm-requests$path'
+        '${query.isEmpty ? '' : '?$query'}',
+      ),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load alarm requests.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// Take back a request BFP has not answered (whoever asked): POST
+  /// /alarm-requests/{id}/cancel. It stays in the history as Cancelled.
+  Future<Map<String, dynamic>> cancelAlarmRequest(String id) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/alarm-requests/$id/cancel'),
+      headers: _jsonAuth,
+      body: jsonEncode(const <String, Object>{}),
+    );
+    return _decode(resp);
+  }
+
+  /// Execute (apply) an alarm request — BFP only: POST /alarm-requests/{id}/execute.
+  Future<Map<String, dynamic>> executeAlarmRequest(
+    String id, {
+    String? notes,
+  }) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/alarm-requests/$id/execute'),
+      headers: _jsonAuth,
+      body: jsonEncode({'notes': ?notes}),
+    );
+    return _decode(resp);
+  }
+
+  /// Reject an alarm request — BFP only: POST /alarm-requests/{id}/reject.
+  Future<Map<String, dynamic>> rejectAlarmRequest(
+    String id, {
+    String? notes,
+  }) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/alarm-requests/$id/reject'),
+      headers: _jsonAuth,
+      body: jsonEncode({'notes': ?notes}),
+    );
+    return _decode(resp);
+  }
+
+  // v11 has no markEnRoute: the first Accept carries an incident through
+  // verified into en_route in one act (§2.5.1), so a responder opening it is
+  // already rolling. Arrived is the next thing they press.
+
+  /// Advance to arrived: POST /incidents/{id}/arrived.
+  Future<Map<String, dynamic>> markArrived(String id) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/arrived'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  /// Say what is burning, on scene (PRD v14 §4.5.3):
+  /// POST /incidents/{id}/fire-type. Returns the incident.
+  Future<Map<String, dynamic>> setFireType(
+    String id,
+    FireClassification fire,
+  ) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/fire-type'),
+      headers: _jsonAuth,
+      body: jsonEncode(fire.toJson()),
+    );
+    return _decode(resp);
+  }
+
+  // Withdraw went with manual dispatch (§2.5): there is no assignment to take
+  // back. A responder who did not go simply is not on the report's roster.
+
+  /// List dispatches on an incident: GET /incidents/{id}/dispatches.
+  Future<List<dynamic>> getDispatches(String id) async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/dispatches'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load dispatches.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// Latest location per responder: GET /incidents/{id}/responders/locations.
+  Future<List<dynamic>> getResponderLocations(String id) async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/responders/locations'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(
+        resp.statusCode,
+        t('Failed to load responder locations.'),
+      );
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// Post one responder GPS fix (5 s cadence): POST /incidents/{id}/location.
+  Future<void> postResponderLocation(
+    String id, {
+    required double lat,
+    required double lng,
+    double? accuracyM,
+    double? speedMps,
+    double? headingDeg,
+    String? dispatchId,
+  }) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/location'),
+      headers: _jsonAuth,
+      body: jsonEncode({
+        'lat': lat,
+        'lng': lng,
+        'captured_at': DateTime.now().toUtc().toIso8601String(),
+        'accuracy_m': ?accuracyM,
+        'speed_mps': ?speedMps,
+        'heading_deg': ?headingDeg,
+        'dispatch_id': ?dispatchId,
+      }),
+    );
+    _decode(resp);
+  }
+
+  /// An incident's member reports with reporter name + signed photo (sub-admin
+  /// review): GET /incidents/{id}/reports.
+  Future<List<dynamic>> getIncidentReports(String id) async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/reports'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load reports.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// Verify — "this is a real fire": POST /incidents/{id}/verify (v12 §2.5.1).
+  ///
+  /// Sends nobody. The first verify moves the incident Reported -> Verified;
+  /// then anyone going responds ([selfDispatch]). Responders may verify as well
+  /// as captains. A responder finding it already verified is told to respond.
+  Future<Map<String, dynamic>> verifyIncident(String id) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/verify'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  /// A coordinator has seen this incident: stop their reminder pings
+  /// (POST /incidents/{id}/seen, PRD v14 §4.13.2). Best-effort: a reminder
+  /// that keeps coming is better than an error on opening an incident.
+  Future<void> markIncidentSeen(String id) async {
+    try {
+      await _client.post(
+        Uri.parse('${ApiConfig.baseUrl}/incidents/$id/seen'),
+        headers: _auth,
+      );
+    } catch (_) {
+      // best-effort
+    }
+  }
+
+  /// Two Areas that have grown to within reach of each other and wait on a
+  /// merge-or-keep-separate decision (120 s window): GET
+  /// /areas/overlaps/pending. Items carry area_a_id/area_b_id, their
+  /// designations, distance_m and expires_at.
+  Future<List<dynamic>> getPendingOverlaps() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/areas/overlaps/pending'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) _decode(resp); // throws with the server's words
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// Fold Area B into Area A: POST /areas/overlaps/{id}/merge.
+  Future<Map<String, dynamic>> mergeOverlap(String overlapId) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/areas/overlaps/$overlapId/merge'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  /// Keep two overlapping Areas apart: POST /areas/overlaps/{id}/keep-separate.
+  Future<Map<String, dynamic>> keepOverlapSeparate(String overlapId) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/areas/overlaps/$overlapId/keep-separate'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  /// What this person has done, newest first, from the audit log: GET
+  /// /audit-logs?actor_user_id=… (Admin and sub-admins only; a sub-admin sees
+  /// entries for incidents their agency can see).
+  Future<List<dynamic>> getMyDecisions(String userId, {int limit = 200}) async {
+    final query = Uri(
+      queryParameters: {'actor_user_id': userId, 'limit': '$limit'},
+    ).query;
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/audit-logs?$query'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) _decode(resp); // throws with the server's words
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// The AI summaries written for one incident, newest first: GET
+  /// /incidents/{id}/summaries. Written once the fire is out (v1.12.5).
+  Future<List<dynamic>> getIncidentSummaries(String id) async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/summaries'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) _decode(resp); // throws with the server's words
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// Reject an incident (sub-admin): POST /incidents/{id}/reject.
+  Future<Map<String, dynamic>> rejectIncident(String id, String reason) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/reject'),
+      headers: _jsonAuth,
+      body: jsonEncode({'reason': reason}),
+    );
+    return _decode(resp);
+  }
+
+  /// Resolve an incident (sub-admin): POST /incidents/{id}/resolve.
+  Future<Map<String, dynamic>> resolveIncident(String id) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/resolve'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  /// File the Post-Incident Report (team captain, Master Context v10 §2.5):
+  /// POST /incidents/{id}/post-incident-report. Single submit — the report and
+  /// the incident's close commit together, and a filed report cannot be edited.
+  ///
+  /// Everything here was picked on the form, not typed. [units] items are
+  /// {name, type?, equipment_id?}; [roster] items are {name, user_id?}.
+  Future<Map<String, dynamic>> filePostIncidentReport(
+    String id, {
+    DateTime? incidentAt,
+    DateTime? fireOutAt,
+    required List<Map<String, dynamic>> units,
+    required String driverName,
+    String? driverUserId,
+    required List<Map<String, dynamic>> roster,
+    required List<String> equipmentTaken,
+    String? notes,
+    bool falseAlarm = false,
+    String? falseAlarmNote,
+  }) async {
+    final types = <String>[];
+    for (final u in units) {
+      final t = (u['type'] as String?) ?? 'Unit';
+      if (!types.contains(t)) types.add(t);
+    }
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/post-incident-report'),
+      headers: _jsonAuth,
+      body: jsonEncode({
+        'incident_at': ?incidentAt?.toUtc().toIso8601String(),
+        'fire_out_at': ?fireOutAt?.toUtc().toIso8601String(),
+        'units': units,
+        // A server from before several units could be recorded reads one
+        // truck: the units as a line. The current server ignores these once
+        // `units` is there.
+        'truck_equipment_id': ?(units.isEmpty
+            ? null
+            : units.first['equipment_id']),
+        'truck_label': units.map((u) => u['name']).join(', '),
+        'truck_type': types.join(', '),
+        'driver_name': driverName,
+        'driver_user_id': ?driverUserId,
+        'roster': roster,
+        'equipment_taken': equipmentTaken,
+        // The captain's own words; the AI summary reads them.
+        'notes': ?notes,
+        // v11 §2.5.3: the team reached the scene and found nothing. The server
+        // requires the reason whenever the flag is set.
+        'false_alarm': falseAlarm,
+        'false_alarm_note': ?falseAlarmNote,
+      }),
+    );
+    return _decode(resp);
+  }
+
+  /// Incidents the signed-in captain's team still owes a Post-Incident Report
+  /// for — fire out, and their team has not filed:
+  /// GET /post-incident-reports/owed. Each responding team files its own, so an
+  /// incident another team already closed can still be owed here.
+  Future<List<dynamic>> getOwedPostIncidentReports() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/post-incident-reports/owed'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load pending reports.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// The members of the signed-in captain's organisation — who the
+  /// Post-Incident Report offers as driver and for the roster:
+  /// GET /organizations/mine/members.
+  Future<List<dynamic>> getMyOrgMembers() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/organizations/mine/members'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load your team.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  // ---- Responder accounts (coordinator, v1.12.4) ----------------------------
+
+  /// The coordinator's responder accounts — their agency, their team:
+  /// GET /team/responders. Active first.
+  Future<List<dynamic>> getTeamResponders() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/team/responders'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, t('Failed to load your responders.'));
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// The address a new responder with this name would get now
+  /// ("jdelacruz.resfir@replit.com"): GET /team/responders/email-preview.
+  Future<String> previewResponderEmail(
+    String firstName,
+    String lastName,
+  ) async {
+    final uri = Uri.parse('${ApiConfig.baseUrl}/team/responders/email-preview')
+        .replace(
+          queryParameters: {'first_name': firstName, 'last_name': lastName},
+        );
+    final resp = await _client.get(uri, headers: _auth);
+    return _decode(resp)['email'] as String;
+  }
+
+  /// Create a responder account: POST /team/responders. Returns
+  /// {responder, email, personal_email, invite_email_sent, detail}: with
+  /// [personalEmail] the link to set the password goes there (the 6 November
+  /// list). Without one, a temporary_password, only this once.
+  Future<Map<String, dynamic>> createResponder({
+    required String firstName,
+    required String lastName,
+    String? personalEmail,
+    String? mobile,
+  }) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/team/responders'),
+      headers: _jsonAuth,
+      body: jsonEncode({
+        'first_name': firstName,
+        'last_name': lastName,
+        'personal_email': ?personalEmail,
+        'mobile': ?mobile,
+      }),
+    );
+    return _decode(resp);
+  }
+
+  /// A coordinator's or responder's own email, where their password links go:
+  /// PUT /auth/me/personal-email. A link to confirm it is sent there; the
+  /// answer says so.
+  Future<String> setPersonalEmail(String email) async {
+    final resp = await _authed(
+      () => _client.put(
+        Uri.parse('${ApiConfig.baseUrl}/auth/me/personal-email'),
+        headers: _jsonAuth,
+        body: jsonEncode({'email': email}),
+      ),
+    );
+    return (_decode(resp)['message'] as String?) ?? '';
+  }
+
+  /// A new temporary password for a responder, returned once:
+  /// POST /team/responders/{id}/reset-password.
+  Future<Map<String, dynamic>> resetResponderPassword(String id) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/team/responders/$id/reset-password'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  /// Stop a responder account signing in (it keeps its history):
+  /// POST /team/responders/{id}/deactivate.
+  Future<Map<String, dynamic>> deactivateResponder(String id) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/team/responders/$id/deactivate'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  /// Let a deactivated responder sign in again:
+  /// POST /team/responders/{id}/reactivate.
+  Future<Map<String, dynamic>> reactivateResponder(String id) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/team/responders/$id/reactivate'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  // ---- AI summaries (coordinator, v1.12.5) ----------------------------------
+
+  /// Every incident a team filed a report for, newest first, each with its
+  /// newest AI summary and a `state` — ready, writing (the server is writing
+  /// it; refresh shortly) or unavailable (no AI key): GET /ai-summaries.
+  Future<List<dynamic>> getAiSummaries() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/ai-summaries'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) _decode(resp); // throws with the server's words
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// A five-minute link to the incident's PDF for the phone's browser, which
+  /// cannot send the sign-in: POST /incidents/{id}/report-link. The PDF is
+  /// built when the link is opened, so it carries every report filed by then.
+  Future<Uri> getReportLink(String id) async {
+    final resp = await _client.post(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/report-link'),
+      headers: _auth,
+    );
+    return Uri.parse('${ApiConfig.baseUrl}${_decode(resp)['path']}');
+  }
+
+  /// A filed Post-Incident Report: GET /incidents/{id}/post-incident-report.
+  Future<Map<String, dynamic>> getPostIncidentReport(String id) async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/$id/post-incident-report'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  /// Responder dashboard counters: GET /incidents/stats.
+  Future<Map<String, dynamic>> getIncidentStats() async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/incidents/stats'),
+      headers: _auth,
+    );
+    return _decode(resp);
+  }
+
+  /// Map layer reads (any authenticated user — Master Context v10 §2.4).
+  Future<List<dynamic>> getHydrants() => _mapLayer('hydrants');
+  Future<List<dynamic>> getRiskZones() => _mapLayer('risk-zones');
+  Future<List<dynamic>> getBodiesOfWater() => _mapLayer('bodies-of-water');
+  Future<List<dynamic>> getUndergroundCisterns() =>
+      _mapLayer('underground-cisterns');
+
+  Future<List<dynamic>> _mapLayer(String layer) async {
+    final resp = await _client.get(
+      Uri.parse('${ApiConfig.baseUrl}/map/$layer'),
+      headers: _auth,
+    );
+    if (resp.statusCode >= 400) {
+      throw ApiException(resp.statusCode, 'Failed to load $layer.');
+    }
+    return jsonDecode(resp.body) as List<dynamic>;
+  }
+
+  /// Trade the stored refresh token for a new session. True when it worked.
+  ///
+  /// Supabase rotates the refresh token on every use, so two concurrent
+  /// refreshes would race and one would present a token the server has already
+  /// retired. Callers therefore share a single in-flight attempt.
+  Future<bool> _refreshSession() {
+    final inFlight = _refreshing;
+    if (inFlight != null) return inFlight;
+    final attempt = _doRefresh();
+    _refreshing = attempt;
+    return attempt.whenComplete(() => _refreshing = null);
+  }
+
+  Future<bool> _doRefresh() async {
+    // The closed-app location report (LocationBeacon) runs in its own isolate
+    // and may have refreshed — and so rotated — the session since this one
+    // last read it. Presenting the retired refresh token would end the
+    // session, so take the stored pair first when it is newer.
+    if (await _adoptNewerStoredSession()) return true;
+    final token = Session.instance.refreshToken;
+    if (token == null || token.isEmpty) return false;
+    try {
+      final resp = await _raw.post(
+        Uri.parse('${ApiConfig.baseUrl}/auth/refresh'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'refresh_token': token}),
+      );
+      if (resp.statusCode >= 400) return false;
+      _storeSession(jsonDecode(resp.body) as Map<String, dynamic>);
+      await Session.instance.persist();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// True when storage holds a different refresh token from this isolate's,
+  /// now adopted along with its access token.
+  Future<bool> _adoptNewerStoredSession() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.reload();
+      final stored = prefs.getString('refresh_token');
+      final access = prefs.getString('access_token');
+      if (stored == null || stored.isEmpty) return false;
+      if (access == null || access.isEmpty) return false;
+      if (stored == Session.instance.refreshToken) return false;
+      if (access == Session.instance.accessToken) return false;
+      await Session.instance.restore();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Send a request whose 401 means the session is over.
+  ///
+  /// [_client] has already renewed a lapsed access token and replayed the
+  /// request, so a 401 that reaches here is one renewing could not fix: the
+  /// refresh token is missing or also expired. The session is cleared —
+  /// leaving dead credentials on the device is what made this stick once —
+  /// and [SessionExpiredException] is thrown for the caller to route to
+  /// login. Used by the calls the app starts up with (/auth/me and friends).
+  Future<http.Response> _authed(Future<http.Response> Function() send) async {
+    final resp = await send();
+    if (resp.statusCode == 401) {
+      await Session.instance.clear();
+      throw SessionExpiredException();
+    }
+    return resp;
+  }
+
+  void _storeSession(Map<String, dynamic> data) {
+    Session.instance.setTokens(
+      accessToken: data['access_token'] as String,
+      refreshToken: data['refresh_token'] as String?,
+      email: data['email'] as String?,
+    );
+  }
+
+  Map<String, dynamic> _decode(http.Response resp) {
+    Map<String, dynamic> body;
+    try {
+      body = resp.body.isNotEmpty
+          ? jsonDecode(resp.body) as Map<String, dynamic>
+          : <String, dynamic>{};
+    } catch (_) {
+      // Not JSON. The backend always answers with JSON, so this means the app
+      // is talking to something that is not RepLiT — which in practice means
+      // the address was baked into the build wrongly. It used to surface as a
+      // FormatException that no caller expected, so every screen reported it as
+      // "could not reach the server" and the real cause stayed invisible.
+      throw ApiException(
+        resp.statusCode,
+        'The server at ${ApiConfig.host} did not reply with RepLiT data. '
+        'This build points at the wrong address — install the latest version.',
+      );
+    }
+    if (resp.statusCode >= 400) {
+      final code = body['error'] is String ? body['error'] as String : null;
+      // A burner email address (backend v1.12.23), refused at sign-up, for a
+      // responder or as a personal email: the server names the service in
+      // English, so every screen says it in the app's own words instead.
+      final message = switch (code) {
+        'disposable_email' => t(
+          "Temporary email addresses can't be used. Use an email that will "
+          'last, like your Gmail.',
+        ),
+        // 18 and over (v1.12.27, app/services/age.py).
+        'underage' => t('You must be 18 or older to use RepLiT.'),
+        // An organisation the central hub suspended or revoked (backend
+        // v1.12.28): nobody of it signs in until it is restored.
+        'organization_suspended' => t(
+          "Your organization's RepLiT access is suspended. Ask the central "
+          'hub (Barangay 76) why, and when it will be restored.',
+        ),
+        'organization_revoked' => t(
+          'Your organization has been removed from RepLiT. Ask the central '
+          'hub (Barangay 76) if you think this is a mistake.',
+        ),
+        _ =>
+          (body['message'] as String?) ??
+              'Request failed (${resp.statusCode}).',
+      };
+      final details = body['details'] is Map<String, dynamic>
+          ? body['details'] as Map<String, dynamic>
+          : null;
+      // A citizen whose phone is not verified is refused everywhere but the
+      // verification routes. Whichever screen hit it, the answer is the same:
+      // show the gate. RoleGate catches it at start-up; this catches the rest.
+      if (resp.statusCode == 403 && code == PhoneGate.errorCode) {
+        PhoneGate.trip();
+      }
+      throw ApiException(
+        resp.statusCode,
+        message,
+        code: code,
+        details: details,
+      );
+    }
+    return body;
+  }
+}
+
+/// Renews a lapsed access token for any request, then sends it again.
+///
+/// Access tokens last about an hour. Only the start-up calls used to renew
+/// one, so an hour into a response every other request — the location fixes
+/// the server marks a crew arrived from, the incident polls, Mark arrived —
+/// went out with a dead token and failed quietly; the GPS arrival never came.
+/// Now a 401 on a request that carried a token spends the refresh token once
+/// (shared by every request that hit it, since Supabase rotates it), and the
+/// request is replayed with the new token. A multipart upload cannot be
+/// replayed; it still renews, so its retry goes through.
+///
+/// When renewing fails the 401 comes back saying the session has ended, in
+/// words a person can act on, rather than the server's note about a header.
+class _RenewingClient extends http.BaseClient {
+  _RenewingClient(this._inner, this._renew);
+
+  final http.Client _inner;
+  final Future<bool> Function() _renew;
+
+  static const _ended = 'Your session has ended. Please sign in again.';
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final authorised =
+        request.headers['Authorization']?.startsWith('Bearer') ?? false;
+    final replay = authorised && request is http.Request
+        ? _copy(request)
+        : null;
+    final first = await _inner.send(request);
+    if (first.statusCode == 403 && authorised) {
+      // Signed in on another phone: whichever call hears it first, every
+      // screen gives way to the warning (SignedInElsewhereScreen).
+      final body = await first.stream.toBytes();
+      if (utf8
+          .decode(body, allowMalformed: true)
+          .contains('"signed_in_elsewhere"')) {
+        ApiClient.signedInElsewhere();
+      }
+      return http.StreamedResponse(
+        Stream.value(body),
+        403,
+        headers: first.headers,
+        request: first.request,
+        reasonPhrase: first.reasonPhrase,
+      );
+    }
+    if (first.statusCode != 401 || !authorised) return first;
+    final body = await first.stream.toBytes();
+    final again = http.StreamedResponse(
+      Stream.value(body),
+      401,
+      headers: first.headers,
+      request: first.request,
+      reasonPhrase: first.reasonPhrase,
+    );
+    if (!await _renew()) {
+      return http.StreamedResponse(
+        Stream.value(
+          utf8.encode(
+            jsonEncode({'message': _ended, 'error': 'session_expired'}),
+          ),
+        ),
+        401,
+        headers: const {'content-type': 'application/json'},
+        request: first.request,
+      );
+    }
+    if (replay == null) return again;
+    replay.headers['Authorization'] =
+        'Bearer ${Session.instance.accessToken ?? ''}';
+    return _inner.send(replay);
+  }
+
+  static http.Request _copy(http.Request r) => http.Request(r.method, r.url)
+    ..bodyBytes = r.bodyBytes
+    ..headers.addAll(r.headers)
+    ..followRedirects = r.followRedirects
+    ..maxRedirects = r.maxRedirects
+    ..persistentConnection = r.persistentConnection;
+
+  @override
+  void close() => _inner.close();
+}

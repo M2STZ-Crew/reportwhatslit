@@ -1,0 +1,127 @@
+import 'package:flutter/material.dart';
+
+import '../../theme.dart';
+import '../../widgets/design.dart';
+import '../../i18n/i18n.dart';
+
+/// Shared label/colour helpers for incident status + agency, used across the
+/// responder console.
+
+/// After fire out (Master Context v10 §2.5): the response is over. The
+/// incident then waits in 'post_incident_report' until its team captain files,
+/// and 'closed' is terminal. Mirrors the post-fire part of OFF_FEED_STATUSES in
+/// app/services/incident.py.
+const Set<String> kAfterFireOut = {
+  'fire_out',
+  'post_incident_report',
+  'closed',
+};
+
+/// An incident's status colour on the staff screens: the Lifecycle chip's
+/// tone (see [AppColors.forStatus]). Anything the lifecycle does not name is
+/// still waiting for a decision.
+Color responderStatusColor(String status) {
+  final tone = AppColors.forStatus(status);
+  return tone == AppColors.muted ? AppColors.warn : tone;
+}
+
+/// The status in the PRD v12 words the Lifecycle chip uses ("En route",
+/// "Report pending") — the same words a resident's rail shows.
+String responderStatusLabel(String status) => LifecycleChip.word(status);
+
+/// What an agency is called on screen.
+String agencyLabel(String? agency) => switch (agency) {
+  'fire_volunteer' => t('Fire Volunteer'),
+  'bfp' => t('Bureau of Fire'),
+  'police' => t('Police'),
+  'medical' => t('Medical'),
+  'barangay' => t('Barangay'),
+  'coastguard' => t('Coast Guard'),
+  _ => t('Response team'),
+};
+
+/// Response Teams exist in all five agencies (v10 §2.6), but fire codes — Need
+/// Water, Fire Out — are the fire service's. A police, medical or barangay
+/// crew is not offered them.
+bool isFireCrew(String? agency) =>
+    agency == 'fire_volunteer' || agency == 'bfp';
+
+/// Mirrors POST /alarm-requests: of the Response Teams, only Fire Volunteer
+/// responders may ask BFP to raise the alarm. Anyone else would be refused,
+/// so the control is not shown to them (§2.7.1).
+bool mayRequestAlarm(String? agency) => agency == 'fire_volunteer';
+
+/// Whether Admin has routed an incident to this responder's agency or team
+/// (v10 §2.6.2), as a short label — null when it has not.
+///
+/// A detail (with `routes`) can say "your team"; a feed summary only knows
+/// which agencies were routed, so it says the agency.
+String? routingLabel(
+  Map<String, dynamic> incident, {
+  required String? agency,
+  String? orgId,
+}) {
+  if (agency == null) return null;
+  final routes = incident['routes'];
+  if (routes is List) {
+    final mine = routes.cast<Map<String, dynamic>>().where(
+      (r) => r['agency'] == agency,
+    );
+    if (mine.isEmpty) return null;
+    if (orgId != null && mine.any((r) => r['organization_id'] == orgId)) {
+      return t('ROUTED TO YOUR TEAM');
+    }
+    if (mine.any((r) => r['organization_id'] == null)) {
+      return t('ROUTED TO {responderAgencyLabel}', {
+        'responderAgencyLabel': responderAgencyLabel(agency).toUpperCase(),
+      });
+    }
+    final teams = mine
+        .map((r) => r['organization_name'] as String?)
+        .whereType<String>();
+    return teams.isEmpty
+        ? null
+        : t('ROUTED TO {join}', {'join': teams.join(', ').toUpperCase()});
+  }
+  final routed = incident['routed_agencies'];
+  if (routed is List && routed.contains(agency)) {
+    return t('ROUTED TO {responderAgencyLabel}', {
+      'responderAgencyLabel': responderAgencyLabel(agency).toUpperCase(),
+    });
+  }
+  return null;
+}
+
+/// "Ramon Dizon · Hercules Fire Brigade": who verified an incident and the
+/// team they verified it for (the team as it was when they pressed Verify).
+/// The agency stands in for a verifier with no team; an Admin has neither.
+/// Null while the incident is unverified.
+String? verifierLine(Map<String, dynamic>? incident) {
+  final name = (incident?['verified_by_name'] as String?)?.trim();
+  if (name == null || name.isEmpty) return null;
+  final org = (incident?['verified_by_organization'] as String?)?.trim();
+  final agency = incident?['verified_by_agency'] as String?;
+  final team = org != null && org.isNotEmpty
+      ? org
+      : agency == null
+      ? t('Admin')
+      : responderAgencyLabel(agency);
+  return '$name · $team';
+}
+
+String responderAgencyLabel(String? agency) {
+  switch (agency) {
+    case 'fire_volunteer':
+      return t('Fire Volunteer');
+    case 'bfp':
+      return t('BFP');
+    case 'barangay':
+      return t('Barangay');
+    case 'medical':
+      return t('Medical');
+    case 'police':
+      return t('Police');
+    default:
+      return t('Responder');
+  }
+}

@@ -1,0 +1,575 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+
+import '../../api/api_client.dart';
+import '../../theme.dart';
+import '../../theme_choice.dart';
+import '../../widgets/map_tiles.dart';
+import '../../widgets/design.dart';
+import '../../widgets/ops_layers.dart';
+import '../../widgets/staff_shell.dart';
+import '../responder/responder_status.dart';
+import 'coordinator_nav.dart';
+import 'pending_reports_screen.dart';
+import '../../widgets/you_are_here.dart';
+import '../../api/live_refresh.dart';
+import '../../widgets/app_icons.dart';
+import '../../i18n/i18n.dart';
+
+Color get _ink => ThemeChoice.palette.onBackground;
+Color get _panel => ThemeChoice.palette.glassDim;
+Color get _panelBorder => ThemeChoice.palette.line;
+Color get _red => ThemeChoice.palette.live;
+Color get _orange => ThemeChoice.palette.accent;
+Color get _green => ThemeChoice.palette.ok;
+Color get _grey => ThemeChoice.palette.muted;
+const LatLng _pasay = LatLng(14.5378, 121.0014);
+
+/// Coordinator dashboard — live counters + a layered operational map, in the
+/// shared staff frame ([StaffScaffold]: the console menu and the COORDINATOR
+/// tag). Incident markers route by status through [openCoordinatorIncident].
+/// The map layers are the shared staff set in widgets/ops_layers.dart.
+class SubAdminDashboardScreen extends StatefulWidget {
+  const SubAdminDashboardScreen({super.key, required this.me});
+
+  final Map<String, dynamic> me;
+
+  @override
+  State<SubAdminDashboardScreen> createState() =>
+      _SubAdminDashboardScreenState();
+}
+
+class _SubAdminDashboardScreenState extends State<SubAdminDashboardScreen> {
+  /// Re-read the moment any incident this agency sees changes (v12).
+  late final LiveRefresh _live = LiveRefresh(
+    agencyChannels(_agency),
+    () => _load(),
+  );
+
+  final MapFollow _follow = MapFollow();
+
+  final ApiClient _api = ApiClient();
+  final MapController _map = MapController();
+  Timer? _poll;
+
+  Map<String, dynamic>? _stats;
+  List<Map<String, dynamic>> _incidents = [];
+  final Set<String> _enabled = {'incidents'};
+  final Map<String, List<OpsPoint>> _cache = {};
+
+  String? get _agency => widget.me['agency_type'] as String?;
+
+  late final List<OpsLayer> _layers = opsLayers(_api);
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+    _live.start();
+    _poll = Timer.periodic(const Duration(seconds: 10), (_) => _load());
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    unawaited(_live.dispose());
+    _follow.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    try {
+      final results = await Future.wait([
+        _api.getIncidentStats(),
+        _api.getIncidents(),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _stats = results[0] as Map<String, dynamic>;
+        _incidents = (results[1] as List).cast<Map<String, dynamic>>();
+      });
+    } catch (_) {
+      // keep last known data
+    }
+  }
+
+  void _toast(String m) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+
+  Future<void> _toggleLayer(OpsLayer layer) async {
+    if (_enabled.contains(layer.key)) {
+      setState(() => _enabled.remove(layer.key));
+      return;
+    }
+    setState(() => _enabled.add(layer.key));
+    if (layer.load != null && !_cache.containsKey(layer.key)) {
+      try {
+        final pts = await layer.load!();
+        if (mounted) setState(() => _cache[layer.key] = pts);
+      } catch (_) {
+        if (mounted) {
+          _toast(t('Could not load {label}.', {'label': layer.label}));
+        }
+      }
+    }
+  }
+
+  // Route an incident marker tap to the right coordinator screen.
+  Future<void> _openIncident(Map<String, dynamic> inc) async {
+    final changed = await openCoordinatorIncident(
+      context,
+      incident: inc,
+      me: widget.me,
+      api: _api,
+    );
+    if (changed && mounted) _load();
+  }
+
+  // ------------------------------------------------------------- build ---
+  @override
+  Widget build(BuildContext context) {
+    return StaffScaffold(
+      me: widget.me,
+      page: StaffPage.dashboard,
+      home: true,
+      title: t('Dashboard'),
+      body: Column(
+        children: [
+          if (_pendingReports > 0) _pendingBanner(),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
+            child: _statsGrid(),
+          ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(24, 8, 24, 16),
+              child: _mapCard(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Fire out, Post-Incident Report not yet filed (v10 §2.5) — from the stats.
+  int get _pendingReports => (_stats?['pending_reports'] as num?)?.toInt() ?? 0;
+
+  Future<void> _openPendingReports() async {
+    await Navigator.of(context).push<bool>(
+      MaterialPageRoute(builder: (_) => PendingReportsScreen(api: _api)),
+    );
+    if (mounted) _load();
+  }
+
+  /// A standing reminder while reports are owed. No incident becomes terminal
+  /// without its record, so these do not go away on their own.
+  Widget _pendingBanner() {
+    final n = _pendingReports;
+    final tint = context.pal.forStatus('post_incident_report');
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(24, 12, 24, 0),
+      child: Panel(
+        onTap: _openPendingReports,
+        radius: AppRadius.control,
+        color: tint.withValues(alpha: 0.08),
+        border: tint.withValues(alpha: 0.4),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            Icon(AppIcons.assignmentLate, color: tint, size: 18),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                n == 1
+                    ? t('1 Post-Incident Report to file')
+                    : t('{n} Post-Incident Reports to file', {'n': n}),
+                style: context.type.rowTitle.copyWith(fontSize: 13),
+              ),
+            ),
+            Icon(AppIcons.chevronRight, color: tint),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ------------------------------------------------------------ stats ---
+  Widget _statsGrid() {
+    final s = _stats;
+    return Column(
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: _statCard(
+                '${s?['active_incidents'] ?? '–'}',
+                t('Active Incidents'),
+                t('In progress now'),
+                _red,
+                AppIcons.warning,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _statCard(
+                '${s?['pending_verify'] ?? '–'}',
+                t('Pending Verify'),
+                t('Awaiting review'),
+                _orange,
+                AppIcons.factCheck,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: [
+            Expanded(
+              child: _statCard(
+                '${s?['units_deployed'] ?? '–'}',
+                t('Units Deployed'),
+                t('On the way to or on site'),
+                _orange,
+                AppIcons.localShipping,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: _statCard(
+                '${s?['units_standby'] ?? '–'}',
+                t('Units Standby'),
+                t('Ready to respond'),
+                _grey,
+                AppIcons.groups,
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// A dashboard figure. The design's stat leads with the number, heavy and
+  /// tightly tracked, and puts the caption underneath — someone scanning a
+  /// console needs the count first.
+  Widget _statCard(
+    String value,
+    String title,
+    String subtitle,
+    Color color,
+    IconData icon,
+  ) {
+    return Panel(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+      color: context.pal.glassDim,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Flexible(
+                child: Text(
+                  value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: context.type.numeral.copyWith(
+                    fontSize: 30,
+                    color: color,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconWell(tint: color, icon: icon, size: 30, glyph: 15),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            title.toUpperCase(),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: context.type.cardTitle.copyWith(fontSize: 12),
+          ),
+          const SizedBox(height: 5),
+          Text(
+            subtitle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: context.type.meta,
+          ),
+        ],
+      ),
+    );
+  }
+
+  // -------------------------------------------------------- map card ---
+  Widget _mapCard() {
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: _panel,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _panelBorder),
+      ),
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        t('Live Map'),
+                        style: TextStyle(
+                          color: _ink,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        t('Real-time incidents across Pasay City'),
+                        style: context.type.meta,
+                      ),
+                    ],
+                  ),
+                ),
+                Row(
+                  children: [
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: _orange,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      t('Updating live'),
+                      style: TextStyle(color: _orange, fontSize: 10),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          SizedBox(height: 38, child: _chipRow()),
+          const SizedBox(height: 10),
+          Expanded(child: _mapLayer()),
+        ],
+      ),
+    );
+  }
+
+  Widget _chipRow() {
+    return ListView.separated(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      itemCount: _layers.length,
+      separatorBuilder: (_, _) => const SizedBox(width: 8),
+      itemBuilder: (_, i) => _chip(_layers[i]),
+    );
+  }
+
+  Widget _chip(OpsLayer layer) {
+    final on = _enabled.contains(layer.key);
+    return GestureDetector(
+      onTap: () => _toggleLayer(layer),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: on
+              ? layer.colour(context.pal).withValues(alpha: 0.12)
+              : const Color(0xFF1A1A1A),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: on ? layer.colour(context.pal) : const Color(0xFF2A2A2A),
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 14,
+              height: 14,
+              decoration: BoxDecoration(
+                color: layer.colour(context.pal),
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              layer.label,
+              style: TextStyle(
+                color: on ? Colors.white : Colors.white.withValues(alpha: 0.7),
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _mapLayer() {
+    return FlutterMap(
+      mapController: _map,
+      options: MapOptions(
+        initialCenter: _pasay,
+        initialZoom: 13,
+        interactionOptions: kMapGestures,
+        onMapEvent: _follow.onMapEvent,
+      ),
+      children: [
+        MapTiles.layer(light: context.pal.isLight),
+        MarkerLayer(rotate: true, markers: _markers()),
+        YouAreHereLayer(follow: _follow),
+        MapLocationButtons(follow: _follow),
+        MapTiles.attribution(),
+      ],
+    );
+  }
+
+  List<Marker> _markers() {
+    final markers = <Marker>[];
+
+    for (final layer in _layers) {
+      if (layer.key == 'incidents' || !_enabled.contains(layer.key)) continue;
+      final pts = _cache[layer.key];
+      if (pts == null) continue;
+      for (final p in pts) {
+        markers.add(opsMarker(context.pal, layer, p));
+      }
+    }
+
+    if (_enabled.contains('incidents')) {
+      for (final inc in _incidents) {
+        final lat = (inc['centroid_lat'] as num?)?.toDouble();
+        final lng = (inc['centroid_lng'] as num?)?.toDouble();
+        if (lat == null || lng == null) continue;
+        final color = responderStatusColor(
+          (inc['status'] as String?) ?? 'reported',
+        );
+        markers.add(
+          Marker(
+            point: LatLng(lat, lng),
+            width: 30,
+            height: 30,
+            child: GestureDetector(
+              onTap: () => _incidentSheet(inc),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: color,
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.3),
+                    width: 2,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: color.withValues(alpha: 0.5),
+                      blurRadius: 14,
+                    ),
+                  ],
+                ),
+                child: const Icon(
+                  AppIcons.localFireDepartment,
+                  color: Colors.white,
+                  size: 15,
+                ),
+              ),
+            ),
+          ),
+        );
+      }
+    }
+    return markers;
+  }
+
+  void _incidentSheet(Map<String, dynamic> inc) {
+    final status = (inc['status'] as String?) ?? 'reported';
+    showAppSheet<void>(
+      context: context,
+      backgroundColor: context.pal.surfaceSolid,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(
+          top: Radius.circular(AppRadius.sheet),
+        ),
+      ),
+      builder: (_) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 18, 24, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      (inc['designation'] as String?) ?? t('Incident'),
+                      style: TextStyle(
+                        color: _ink,
+                        fontSize: 22,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                  LifecycleChip(status),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Text(
+                t('{value} reports • {value2} responding', {
+                  'value': (inc['report_count'] as num?)?.toInt() ?? 0,
+                  'value2':
+                      (inc['active_dispatch_count'] as num?)?.toInt() ?? 0,
+                }),
+                style: TextStyle(color: context.pal.muted, fontSize: 13),
+              ),
+              if (routingLabel(inc, agency: _agency) case final routed?) ...[
+                const SizedBox(height: 10),
+                Tag(routed, color: _green, dot: true),
+              ],
+              const SizedBox(height: 18),
+              GestureDetector(
+                onTap: () {
+                  Navigator.of(context).pop();
+                  _openIncident(inc);
+                },
+                child: Container(
+                  height: 52,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    gradient: AppColors.accentGradient,
+                    borderRadius: BorderRadius.circular(AppRadius.card),
+                  ),
+                  child: Text(
+                    t('OPEN INCIDENT'),
+                    style: TextStyle(
+                      color: AppColors.accentText,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

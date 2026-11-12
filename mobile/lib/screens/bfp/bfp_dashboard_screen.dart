@@ -1,0 +1,600 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+
+import '../../api/api_client.dart';
+import '../../theme.dart';
+import '../../theme_choice.dart';
+import '../../widgets/map_tiles.dart';
+import '../../widgets/design.dart';
+import '../../widgets/ops_layers.dart';
+import '../../widgets/staff_shell.dart';
+import '../responder/responder_status.dart';
+import '../subadmin/coordinator_nav.dart';
+import 'bfp_alarm_requests_screen.dart';
+import '../../widgets/you_are_here.dart';
+import '../../api/live_refresh.dart';
+import '../../widgets/app_icons.dart';
+import '../../i18n/i18n.dart';
+
+Color get _ink => ThemeChoice.palette.onBackground;
+Color get _panel => ThemeChoice.palette.glassDim;
+Color get _panelBorder => ThemeChoice.palette.line;
+Color get _red => ThemeChoice.palette.live;
+Color get _orange => ThemeChoice.palette.accent;
+Color get _green => ThemeChoice.palette.ok;
+Color get _grey => ThemeChoice.palette.muted;
+const LatLng _pasay = LatLng(14.5378, 121.0014);
+
+/// BFP team captain's dashboard — live counters, the layered map, and the
+/// alarm-request review queue (BFP's exclusive authority).
+///
+/// BFP is a coordinator (Master Context v10 §2.6.1): it rejects, declares fire
+/// out and presses fire codes, and since v11 its Accept verifies an incident
+/// just as a Fire Volunteer's does (§2.5.1). Incidents open the same
+/// coordinator screens a Fire Volunteer captain uses
+/// ([openCoordinatorIncident]).
+class BfpDashboardScreen extends StatefulWidget {
+  const BfpDashboardScreen({super.key, required this.me});
+
+  final Map<String, dynamic> me;
+
+  @override
+  State<BfpDashboardScreen> createState() => _BfpDashboardScreenState();
+}
+
+class _BfpDashboardScreenState extends State<BfpDashboardScreen> {
+  /// Re-read the moment any incident this agency sees changes (v12).
+  late final LiveRefresh _live = LiveRefresh(
+    agencyChannels('bfp'),
+    () => _load(),
+  );
+
+  final MapFollow _follow = MapFollow();
+
+  final ApiClient _api = ApiClient();
+  final MapController _map = MapController();
+  Timer? _poll;
+
+  Map<String, dynamic>? _stats;
+  List<Map<String, dynamic>> _incidents = [];
+  int _pendingAlarms = 0;
+  final Set<String> _enabled = {'incidents'};
+  final Map<String, List<OpsPoint>> _cache = {};
+
+  late final List<OpsLayer> _layers = opsLayers(_api);
+
+  Future<void> _openIncident(Map<String, dynamic> inc) async {
+    final changed = await openCoordinatorIncident(
+      context,
+      incident: inc,
+      me: widget.me,
+      api: _api,
+    );
+    if (changed && mounted) _load();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+    _live.start();
+    _poll = Timer.periodic(const Duration(seconds: 10), (_) => _load());
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    unawaited(_live.dispose());
+    _follow.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    try {
+      final results = await Future.wait([
+        _api.getIncidentStats(),
+        _api.getIncidents(),
+        _api.getAlarmRequests(status: 'pending').catchError((_) => <dynamic>[]),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _stats = results[0] as Map<String, dynamic>;
+        _incidents = (results[1] as List).cast<Map<String, dynamic>>();
+        _pendingAlarms = (results[2] as List).length;
+      });
+    } catch (_) {
+      // keep last known data
+    }
+  }
+
+  void _toast(String m) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+
+  Future<void> _toggleLayer(OpsLayer layer) async {
+    if (_enabled.contains(layer.key)) {
+      setState(() => _enabled.remove(layer.key));
+      return;
+    }
+    setState(() => _enabled.add(layer.key));
+    if (layer.load != null && !_cache.containsKey(layer.key)) {
+      try {
+        final pts = await layer.load!();
+        if (mounted) setState(() => _cache[layer.key] = pts);
+      } catch (_) {
+        if (mounted) {
+          _toast(t('Could not load {label}.', {'label': layer.label}));
+        }
+      }
+    }
+  }
+
+  Future<void> _openAlarmRequests() async {
+    await Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => const BfpAlarmRequestsScreen()));
+    if (mounted) _load();
+  }
+
+  // ------------------------------------------------------------- build ---
+  @override
+  Widget build(BuildContext context) {
+    return StaffScaffold(
+      me: widget.me,
+      page: StaffPage.dashboard,
+      home: true,
+      title: t('Dashboard'),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 16, 24, 4),
+            child: _statsGrid(),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 8, 24, 4),
+            child: _alarmCard(),
+          ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(24, 8, 24, 16),
+              child: _mapCard(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ------------------------------------------------------------ stats ---
+  Widget _statsGrid() {
+    final s = _stats;
+    return Row(
+      children: [
+        Expanded(
+          child: _statCard(
+            '${s?['active_incidents'] ?? '–'}',
+            t('Active Incidents'),
+            t('In progress now'),
+            _red,
+            AppIcons.warning,
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: _statCard(
+            '${s?['units_deployed'] ?? '–'}',
+            t('Units Deployed'),
+            t('On the way or on site'),
+            _orange,
+            AppIcons.localShipping,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// A dashboard figure. The design's stat leads with the number, heavy and
+  /// tightly tracked, and puts the caption underneath — someone scanning a
+  /// console needs the count first.
+  Widget _statCard(
+    String value,
+    String title,
+    String subtitle,
+    Color color,
+    IconData icon,
+  ) {
+    return Panel(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+      color: context.pal.glassDim,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Flexible(
+                child: Text(
+                  value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: context.type.numeral.copyWith(
+                    fontSize: 30,
+                    color: color,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              IconWell(tint: color, icon: icon, size: 30, glyph: 15),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            title.toUpperCase(),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: context.type.cardTitle.copyWith(fontSize: 12),
+          ),
+          const SizedBox(height: 5),
+          Text(
+            subtitle,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: context.type.meta,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _alarmCard() {
+    return GestureDetector(
+      onTap: _openAlarmRequests,
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: _panel,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: _pendingAlarms > 0
+                ? _red.withValues(alpha: 0.5)
+                : _panelBorder,
+          ),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                color: const Color(0x23EF4444),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Icon(AppIcons.campaign, color: _red, size: 20),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    t('Alarm Requests'),
+                    style: TextStyle(
+                      color: _ink,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    _pendingAlarms > 0
+                        ? t('{_pendingAlarms} pending • review & execute', {
+                            '_pendingAlarms': _pendingAlarms,
+                          })
+                        : t('No pending requests'),
+                    style: const TextStyle(
+                      color: Color(0xFF71717B),
+                      fontSize: 11,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (_pendingAlarms > 0)
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 4,
+                ),
+                decoration: BoxDecoration(
+                  color: _red.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: _red.withValues(alpha: 0.5)),
+                ),
+                child: Text(
+                  '$_pendingAlarms',
+                  style: TextStyle(
+                    color: _red,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              )
+            else
+              Icon(AppIcons.chevronRight, color: _grey, size: 20),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // -------------------------------------------------------- map card ---
+  Widget _mapCard() {
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: _panel,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _panelBorder),
+      ),
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        t('Live Map'),
+                        style: TextStyle(
+                          color: _ink,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        t('Real-time incidents across Pasay City'),
+                        style: context.type.meta,
+                      ),
+                    ],
+                  ),
+                ),
+                Row(
+                  children: [
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        color: _orange,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Text(
+                      t('Updating live'),
+                      style: TextStyle(color: _orange, fontSize: 10),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          SizedBox(height: 38, child: _chipRow()),
+          const SizedBox(height: 10),
+          Expanded(child: _mapLayer()),
+        ],
+      ),
+    );
+  }
+
+  Widget _chipRow() {
+    return ListView.separated(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      itemCount: _layers.length,
+      separatorBuilder: (_, _) => const SizedBox(width: 8),
+      itemBuilder: (_, i) => _chip(_layers[i]),
+    );
+  }
+
+  Widget _chip(OpsLayer layer) {
+    final on = _enabled.contains(layer.key);
+    return GestureDetector(
+      onTap: () => _toggleLayer(layer),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: on
+              ? layer.colour(context.pal).withValues(alpha: 0.12)
+              : const Color(0xFF1A1A1A),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: on ? layer.colour(context.pal) : const Color(0xFF2A2A2A),
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 14,
+              height: 14,
+              decoration: BoxDecoration(
+                color: layer.colour(context.pal),
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 8),
+            Text(
+              layer.label,
+              style: TextStyle(
+                color: on ? Colors.white : Colors.white.withValues(alpha: 0.7),
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _mapLayer() {
+    return FlutterMap(
+      mapController: _map,
+      options: MapOptions(
+        initialCenter: _pasay,
+        initialZoom: 13,
+        interactionOptions: kMapGestures,
+        onMapEvent: _follow.onMapEvent,
+      ),
+      children: [
+        MapTiles.layer(light: context.pal.isLight),
+        MarkerLayer(rotate: true, markers: _markers()),
+        YouAreHereLayer(follow: _follow),
+        MapLocationButtons(follow: _follow),
+        MapTiles.attribution(),
+      ],
+    );
+  }
+
+  List<Marker> _markers() {
+    final markers = <Marker>[];
+    for (final layer in _layers) {
+      if (layer.key == 'incidents' || !_enabled.contains(layer.key)) continue;
+      final pts = _cache[layer.key];
+      if (pts == null) continue;
+      for (final p in pts) {
+        markers.add(opsMarker(context.pal, layer, p));
+      }
+    }
+    if (_enabled.contains('incidents')) {
+      for (final inc in _incidents) {
+        final lat = (inc['centroid_lat'] as num?)?.toDouble();
+        final lng = (inc['centroid_lng'] as num?)?.toDouble();
+        if (lat == null || lng == null) continue;
+        final color = responderStatusColor(
+          (inc['status'] as String?) ?? 'reported',
+        );
+        markers.add(
+          Marker(
+            point: LatLng(lat, lng),
+            width: 30,
+            height: 30,
+            child: GestureDetector(
+              onTap: () => _incidentSheet(inc),
+              child: Container(
+                decoration: BoxDecoration(
+                  color: color,
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: Colors.white.withValues(alpha: 0.3),
+                    width: 2,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: color.withValues(alpha: 0.5),
+                      blurRadius: 14,
+                    ),
+                  ],
+                ),
+                child: const Icon(
+                  AppIcons.localFireDepartment,
+                  color: Colors.white,
+                  size: 15,
+                ),
+              ),
+            ),
+          ),
+        );
+      }
+    }
+    return markers;
+  }
+
+  // Read-only incident info (BFP cannot verify/dispatch).
+  void _incidentSheet(Map<String, dynamic> inc) {
+    final status = (inc['status'] as String?) ?? 'reported';
+    final alarm = (inc['alarm_level'] as String?)?.replaceAll('_', ' ');
+    showAppSheet<void>(
+      context: context,
+      backgroundColor: context.pal.surfaceSolid,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(
+          top: Radius.circular(AppRadius.sheet),
+        ),
+      ),
+      builder: (_) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(24, 18, 24, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      (inc['designation'] as String?) ?? t('Incident'),
+                      style: TextStyle(
+                        color: _ink,
+                        fontSize: 22,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                  LifecycleChip(status),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Text(
+                t('{value} reports • {value2} responding', {
+                  'value': (inc['report_count'] as num?)?.toInt() ?? 0,
+                  'value2':
+                      (inc['active_dispatch_count'] as num?)?.toInt() ?? 0,
+                }),
+                style: TextStyle(color: context.pal.muted, fontSize: 13),
+              ),
+              if (alarm != null && alarm.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Icon(AppIcons.campaign, color: _red, size: 16),
+                    const SizedBox(width: 8),
+                    Text(
+                      t('Alarm: {alarm}', {'alarm': alarm.toUpperCase()}),
+                      style: TextStyle(
+                        color: _red,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+              if (routingLabel(inc, agency: 'bfp') case final routed?) ...[
+                const SizedBox(height: 10),
+                Tag(routed, color: _green, dot: true),
+              ],
+              const SizedBox(height: 18),
+              AppButton(
+                t('Open incident'),
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  _openIncident(inc);
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

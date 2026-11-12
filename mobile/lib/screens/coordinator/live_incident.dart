@@ -1,0 +1,1013 @@
+import 'dart:async';
+import 'dart:ui' show ImageFilter;
+
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+
+import '../../api/api_client.dart';
+import '../../api/live_refresh.dart';
+import '../../location/live_position.dart';
+import '../../location/responder_tracker.dart';
+import '../../models/alarm.dart';
+import '../../models/area_view.dart';
+import '../../models/coordinator_powers.dart';
+import '../../theme.dart';
+import '../../widgets/alarm_ask_sheet.dart';
+import '../../widgets/app_icons.dart';
+import '../../widgets/coordinator_kit.dart';
+import '../../widgets/design.dart';
+import '../../widgets/fire_type_row.dart';
+import '../../widgets/map_marker.dart';
+import '../../widgets/map_layers.dart';
+import '../../widgets/map_tiles.dart';
+import '../../widgets/sheet_grip.dart';
+import '../../widgets/you_are_here.dart';
+import '../bfp/bfp_alarm_requests_screen.dart';
+import '../responder/responder_status.dart';
+import '../subadmin/post_incident_report_screen.dart';
+import 'area_decision_screen.dart';
+import 'coordinator_feed.dart';
+import '../../widgets/loading.dart';
+import '../../i18n/i18n.dart';
+
+/// A unit within this distance of the Area's centre is on scene.
+const double _onSceneMetres = 100;
+
+/// How much of the screen LIVE's sheet covers when it opens.
+const double _sheetStart = 0.62;
+const double _sheetMin = 0.3;
+const double _sheetMax = 0.94;
+
+/// The LIVE tab (06 · C11): the incident under way.
+///
+/// Shows the Area the coordinator opened from the queue, else the one they
+/// are going to, else the newest on the ground. With more than one under
+/// way, chips over the map switch between them.
+class LiveTab extends StatelessWidget {
+  const LiveTab({
+    super.key,
+    required this.feed,
+    required this.focus,
+    required this.visible,
+    required this.onFocus,
+  });
+
+  final CoordinatorFeed feed;
+  final String? focus;
+
+  /// Polls only while showing.
+  final bool visible;
+  final ValueChanged<String> onFocus;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        feed,
+        ResponderTracker.instance.sharingFor,
+      ]),
+      builder: (context, _) {
+        final live = [
+          for (final a in feed.active)
+            if (a.live) a,
+          for (final a in feed.active)
+            if (!a.live) a,
+        ];
+        final chosen = liveFocus(live, focus);
+        if (chosen == null) {
+          return SafeArea(
+            bottom: false,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                TabHeader(eyebrow: t('Live'), title: t('Nothing under way')),
+                Expanded(
+                  child: feed.loaded
+                      ? EmptyState(
+                          icon: AppIcons.localFireDepartment,
+                          title: t('No incident is live'),
+                          body: t(
+                            'An Area shows here once it is accepted, with '
+                            'the units on their way and on scene. The queue '
+                            'has what is waiting on you.',
+                          ),
+                        )
+                      : const LoadingView(),
+                ),
+              ],
+            ),
+          );
+        }
+        return LiveIncidentView(
+          key: ValueKey(chosen.id),
+          areaId: chosen.id,
+          me: feed.me,
+          api: feed.api,
+          active: visible,
+          others: live,
+          onSwitch: onFocus,
+          onChanged: feed.load,
+        );
+      },
+    );
+  }
+}
+
+/// Which Area LIVE shows: the one asked for, else the one this phone is
+/// sharing its location for, else the first.
+AreaView? liveFocus(List<AreaView> live, String? focus) {
+  if (live.isEmpty) return null;
+  final mine = ResponderTracker.instance.sharingFor.value;
+  for (final id in [focus, mine]) {
+    for (final a in live) {
+      if (a.id == id) return a;
+    }
+  }
+  return live.first;
+}
+
+/// One live Area: the map with its units, and the sheet over it — status,
+/// how many units are responding, the progress rail, each unit, the alarm
+/// level, this coordinator's own response, and Mark fire out.
+class LiveIncidentView extends StatefulWidget {
+  const LiveIncidentView({
+    super.key,
+    required this.areaId,
+    required this.me,
+    required this.api,
+    this.active = true,
+    this.others = const [],
+    this.onSwitch,
+    this.onChanged,
+  });
+
+  final String areaId;
+  final Map<String, dynamic> me;
+  final ApiClient api;
+
+  /// Polls only while true.
+  final bool active;
+
+  /// Every Area under way, for the switcher.
+  final List<AreaView> others;
+  final ValueChanged<String>? onSwitch;
+
+  /// Something here changed the Area (responded, fire out).
+  final Future<void> Function()? onChanged;
+
+  @override
+  State<LiveIncidentView> createState() => _LiveIncidentViewState();
+}
+
+class _LiveIncidentViewState extends State<LiveIncidentView> {
+  ApiClient get _api => widget.api;
+  late final LiveRefresh _live = LiveRefresh([
+    incidentChannel(widget.areaId),
+  ], _load);
+  final MapFollow _follow = MapFollow();
+  final ResponderTracker _tracker = ResponderTracker.instance;
+
+  /// The details sheet, so its frozen grip can drag it.
+  final DraggableScrollableController _sheetSize =
+      DraggableScrollableController();
+  Timer? _poll;
+
+  AreaView? _area;
+  List<Map<String, dynamic>> _dispatches = const [];
+  List<Map<String, dynamic>> _locations = const [];
+
+  /// BFP: this Area's requests waiting on it. Whoever may ask: their own
+  /// for this Area, newest first.
+  List<AlarmRequest> _asks = const [];
+  bool _busy = false;
+
+  /// "What's burning?" has been asked on this screen: it opens by itself
+  /// once, and after that waits for the red row to be tapped.
+  bool _askedFireType = false;
+
+  String get _myId => widget.me['id'] as String? ?? '';
+  String? get _agency => widget.me['agency_type'] as String?;
+  CoordinatorPowers get _powers => CoordinatorPowers.of(widget.me);
+
+  AlarmRequest? get _myAsk => _asks.isEmpty ? null : _asks.first;
+
+  Map<String, dynamic>? get _mine {
+    for (final d in _dispatches) {
+      if (d['responder_id'] == _myId && d['status'] == 'active') return d;
+    }
+    return null;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+    _live.start();
+    _schedule();
+  }
+
+  @override
+  void didUpdateWidget(LiveIncidentView old) {
+    super.didUpdateWidget(old);
+    if (old.active != widget.active) _schedule();
+  }
+
+  void _schedule() {
+    _poll?.cancel();
+    if (!widget.active) return;
+    _load();
+    _poll = Timer.periodic(const Duration(seconds: 6), (_) => _load());
+  }
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    unawaited(_live.dispose());
+    _follow.dispose();
+    _sheetSize.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    try {
+      final results = await Future.wait([
+        _api.getIncident(widget.areaId),
+        _api.getDispatches(widget.areaId),
+        _api
+            .getResponderLocations(widget.areaId)
+            .catchError((_) => <dynamic>[]),
+        _alarmAsks().catchError((_) => <dynamic>[]),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _area = AreaView(results[0] as Map<String, dynamic>);
+        _dispatches = (results[1] as List).cast<Map<String, dynamic>>();
+        _locations = (results[2] as List).cast<Map<String, dynamic>>();
+        _asks = [
+          for (final r
+              in (results[3] as List).whereType<Map<String, dynamic>>())
+            if (r['area_id'] == widget.areaId) AlarmRequest(r),
+        ];
+      });
+      _syncSharing();
+      _maybeAskFireType();
+    } catch (_) {
+      // Keep the last good picture; the next poll tries again.
+    }
+  }
+
+  /// On scene with nobody yet saying what is burning, and this coordinator
+  /// is one of the units there: ask, once (PRD v14 §4.5.3, mandatory on
+  /// arrival). The red row asks again for as long as it is unanswered.
+  void _maybeAskFireType() {
+    final area = _area;
+    if (_askedFireType || !widget.active || area == null) return;
+    if (!area.asksFireType || !area.onScene) return;
+    if (area.fireType != null || _mine == null) return;
+    if (!_powers.responds) return;
+    _askedFireType = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && ModalRoute.of(context)?.isCurrent != false) {
+        _pickFireType();
+      }
+    });
+  }
+
+  /// C18: what is burning, asked and saved.
+  Future<void> _pickFireType() async {
+    final area = _area;
+    if (area == null) return;
+    _askedFireType = true;
+    if (await askFireType(context, api: _api, area: area)) {
+      await widget.onChanged?.call();
+    }
+    await _load();
+  }
+
+  /// The alarm requests the Alarm level row speaks of ([_asks]). Asked,
+  /// answered or taken back on any phone, they reach this screen over the
+  /// Area's channel, which reloads it.
+  Future<List<dynamic>> _alarmAsks() {
+    if (_powers.decidesAlarm) {
+      return _api.getAlarmRequests(status: 'pending', areaId: widget.areaId);
+    }
+    if (_powers.requestsAlarm) {
+      return _api.getMyAlarmRequests(areaId: widget.areaId);
+    }
+    return Future.value(const <dynamic>[]);
+  }
+
+  /// Share this phone's location while this coordinator is going, and stop
+  /// when their response ends here.
+  void _syncSharing() {
+    final dispatchId = _mine?['id'] as String?;
+    final live = _area?.live ?? false;
+    if (dispatchId != null && live) {
+      _tracker.start(incidentId: widget.areaId, dispatchId: dispatchId);
+    } else if (_tracker.sharingFor.value == widget.areaId) {
+      _tracker.stop();
+    }
+  }
+
+  void _toast(String m) =>
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
+
+  Future<void> _act(Future<void> Function() call, String ok) async {
+    setState(() => _busy = true);
+    try {
+      await call();
+      if (mounted) _toast(ok);
+      await widget.onChanged?.call();
+    } on ApiException catch (e) {
+      if (mounted) _toast(e.message);
+    } catch (_) {
+      if (mounted) _toast(t('Could not do that. Check your connection.'));
+    } finally {
+      await _load();
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _go() async {
+    final area = _area;
+    if (area == null) return;
+    final choice = await showFrameSheet<GoChoice>(
+      context,
+      builder: (_) => GoSheet(area: area, api: _api, alreadyAccepted: true),
+    );
+    if (choice == null || !choice.going || !mounted) return;
+    await _act(() async {
+      await _api.selfDispatch(widget.areaId, vehicleName: choice.unit);
+      if (choice.unit != null) await GoSheet.remember(choice.unit!);
+    }, t('You are responding. Your location is shared while you go.'));
+  }
+
+  void _arrived() =>
+      _act(() => _api.markArrived(widget.areaId), t('Marked on scene.'));
+
+  Future<void> _route() async {
+    final area = _area;
+    if (area == null) return;
+    await openRouteToArea(
+      context,
+      area,
+      markArrived: _mine != null && area.status == 'en_route'
+          ? () => _api.markArrived(widget.areaId)
+          : null,
+    );
+    await _load();
+  }
+
+  /// C12 — confirm, then fire out; the report is offered straight after.
+  Future<void> _fireOut() async {
+    final area = _area;
+    if (area == null) return;
+    final units = _units().map((u) => u.name).toList();
+    final yes = await showFrameSheet<bool>(
+      context,
+      builder: (context) => SheetFrame(
+        children: [
+          SheetTitles(
+            eyebrow: t('Confirm · can\'t be undone'),
+            title: t('Mark {name} fire out?', {'name': area.name}),
+            body: units.isEmpty
+                ? t(
+                    'Everyone responding stands down and stops sharing '
+                    'location. The Area moves to To file until you submit its '
+                    'post-incident report.',
+                  )
+                : units.length == 1
+                ? t(
+                    '{unit} stands down and stops sharing location. The Area '
+                    'moves to To file until you submit its post-incident '
+                    'report.',
+                    {'unit': units.single},
+                  )
+                : t(
+                    '{units} stand down and stop sharing location. The Area '
+                    'moves to To file until you submit its post-incident '
+                    'report.',
+                    {'units': andList(units)},
+                  ),
+          ),
+          const SizedBox(height: 16),
+          AppButton(
+            t('Yes, mark fire out'),
+            run: true,
+            onPressed: () => Navigator.of(context).pop(true),
+          ),
+          const SizedBox(height: 10),
+          AppButton.secondary(
+            t('Not yet, keep it live'),
+            onPressed: () => Navigator.of(context).pop(false),
+          ),
+        ],
+      ),
+    );
+    if (yes != true || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      await _api.resolveIncident(widget.areaId);
+      if (_tracker.sharingFor.value == widget.areaId) await _tracker.stop();
+      if (!mounted) return;
+      await offerPostIncidentReport(
+        context,
+        areaId: widget.areaId,
+        designation: area.designation,
+        api: _api,
+      );
+      await widget.onChanged?.call();
+    } on ApiException catch (e) {
+      if (mounted) _toast(e.message);
+    } catch (_) {
+      if (mounted) _toast(t('Could not mark fire out. Check your connection.'));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// BFP: this Area's requests, in BFP's queue. Whoever may ask: ask BFP to
+  /// raise the alarm, or change or take back what they asked.
+  Future<void> _alarm() async {
+    final area = _area;
+    if (area == null) return;
+    if (_powers.decidesAlarm) {
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) =>
+              BfpAlarmRequestsScreen(api: _api, areaId: widget.areaId),
+        ),
+      );
+      await _load();
+      return;
+    }
+    final waiting = _myAsk != null && _myAsk!.waiting ? _myAsk : null;
+    final ask = await showFrameSheet<AlarmAsk>(
+      context,
+      builder: (_) => AlarmAskSheet(area: area, waiting: waiting),
+    );
+    if (ask == null || !mounted) return;
+    final level = ask.level;
+    if (level == null) {
+      if (waiting == null) return;
+      await _act(
+        () => _api.cancelAlarmRequest(waiting.id),
+        t('Request taken back. BFP no longer sees it.'),
+      );
+      return;
+    }
+    await _act(
+      () => _api.createAlarmRequest(
+        areaId: widget.areaId,
+        alarmLevel: level,
+        justification: ask.why,
+      ),
+      t('Asked BFP for {alarmWord}. You are told when they answer.', {
+        'alarmWord': alarmWord(level),
+      }),
+    );
+  }
+
+  /// What the Alarm level row says under its title.
+  String _alarmLine(AreaView area) {
+    if (_powers.decidesAlarm) {
+      final n = _asks.where((r) => r.waiting).length;
+      return switch (n) {
+        0 => t('Set by BFP · nothing waiting on you'),
+        1 => t('1 request waiting on you'),
+        _ => t('{n} requests waiting on you', {'n': n}),
+      };
+    }
+    if (!_powers.requestsAlarm) return t('Set by BFP');
+    final ask = _myAsk;
+    final at = ask?.answeredAt;
+    final when = at == null ? '' : ' ${agoText(at)}';
+    return switch (ask?.status) {
+      'pending' => t('You asked for {alarmWord} · waiting for BFP', {
+        'alarmWord': alarmWord(ask!.level),
+      }),
+      'approved' when ask!.level == area.alarmLevel => t(
+        'BFP set {alarmWord}{when}, as you asked',
+        {'alarmWord': alarmWord(ask.level), 'when': when},
+      ),
+      'rejected' => t('BFP declined {alarmWord}{when}{value}', {
+        'alarmWord': alarmWord(ask!.level),
+        'when': when,
+        'value': ask.notes == null ? '' : ': ${ask.notes}',
+      }),
+      _ => t('Set by BFP · ask them to raise it'),
+    };
+  }
+
+  /// C06 — straight to the reject sheet: why, then reject. The Area's
+  /// details are their own row ([_details]).
+  Future<void> _reject() async {
+    final area = _area;
+    if (area == null) return;
+    List<Map<String, dynamic>> reports;
+    try {
+      reports = (await _api.getIncidentReports(
+        widget.areaId,
+      )).cast<Map<String, dynamic>>();
+    } catch (_) {
+      reports = const [];
+    }
+    if (!mounted) return;
+    final reason = await showFrameSheet<String>(
+      context,
+      builder: (_) => RejectSheet(area: area, reports: reports),
+    );
+    if (reason == null || !mounted) return;
+    await _act(
+      () => _api.rejectIncident(widget.areaId, reason),
+      t('{name} rejected. It has left the live feed.', {'name': area.name}),
+    );
+  }
+
+  /// The Area's details — where it is, how sure, the summary, every report.
+  Future<void> _details() async {
+    final changed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) =>
+            AreaDecisionScreen(areaId: widget.areaId, me: widget.me, api: _api),
+      ),
+    );
+    if (changed == true) await widget.onChanged?.call();
+    await _load();
+  }
+
+  // -------------------------------------------------------------- units ---
+  List<_Unit> _units() {
+    final groups = <String, List<Map<String, dynamic>>>{};
+    for (final d in _dispatches) {
+      if (d['status'] != 'active') continue;
+      final vehicle = (d['vehicle_name'] as String?)?.trim();
+      final name = vehicle == null || vehicle.isEmpty
+          ? ((d['responder_name'] as String?)?.trim() ?? t('Responder'))
+          : vehicle;
+      groups.putIfAbsent(name, () => []).add(d);
+    }
+    final byResponder = {
+      for (final l in _locations) l['responder_id'] as String?: l,
+    };
+    return [
+      for (final MapEntry(key: name, value: crew) in groups.entries)
+        _Unit(
+          name: name,
+          crew: crew,
+          fix: _newestFix([
+            for (final d in crew) ?byResponder[d['responder_id']],
+          ]),
+        ),
+    ];
+  }
+
+  static Map<String, dynamic>? _newestFix(List<Map<String, dynamic>> fixes) {
+    Map<String, dynamic>? best;
+    for (final f in fixes) {
+      final at = parseTime(f['captured_at']);
+      final bestAt = best == null ? null : parseTime(best['captured_at']);
+      if (best == null ||
+          (at != null && bestAt != null && at.isAfter(bestAt))) {
+        best = f;
+      }
+    }
+    return best;
+  }
+
+  // ------------------------------------------------------------- build ---
+  @override
+  Widget build(BuildContext context) {
+    final area = _area;
+    final centre = area?.centre;
+    if (area == null || centre == null) {
+      // The map's place, then the sheet's, as they will be.
+      return const LoadingView(scrollable: false);
+    }
+    final units = _units();
+    return Stack(
+      children: [
+        Positioned.fill(child: _map(centre, units)),
+        // The top veil keeps the status bar and the chips readable.
+        Positioned(
+          left: 0,
+          right: 0,
+          top: 0,
+          height: 180,
+          child: IgnorePointer(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    context.pal.background.withValues(alpha: 0.92),
+                    context.pal.background.withValues(alpha: 0),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+        if (widget.others.length > 1)
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.only(left: 16, top: 8),
+              child: FilterChips(
+                options: [for (final a in widget.others) a.name],
+                selected: area.name,
+                onSelect: (name) {
+                  for (final a in widget.others) {
+                    if (a.name == name) widget.onSwitch?.call(a.id);
+                  }
+                },
+              ),
+            ),
+          ),
+        DraggableScrollableSheet(
+          controller: _sheetSize,
+          initialChildSize: _sheetStart,
+          minChildSize: _sheetMin,
+          maxChildSize: _sheetMax,
+          builder: (context, scroll) => _sheet(area, units, scroll),
+        ),
+      ],
+    );
+  }
+
+  Widget _map(LatLng centre, List<_Unit> units) {
+    // Framed 300 m around the Area in the strip the sheet leaves open, so
+    // the fire and the units nearing it are in view rather than under the
+    // sheet (six radii since the radius became 50 m).
+    final size = MediaQuery.sizeOf(context);
+    const geo = Distance();
+    final area = LatLngBounds(
+      geo.offset(centre, kAreaRadiusMetres * 6, 315),
+      geo.offset(centre, kAreaRadiusMetres * 6, 135),
+    );
+    return FlutterMap(
+      options: MapOptions(
+        initialCenter: centre,
+        initialZoom: 15.5,
+        initialCameraFit: CameraFit.bounds(
+          bounds: area,
+          padding: EdgeInsets.fromLTRB(
+            24,
+            MediaQuery.paddingOf(context).top + 24,
+            24,
+            size.height * _sheetStart + 16,
+          ),
+        ),
+        backgroundColor: context.pal.background,
+        interactionOptions: kMapGestures,
+        onMapEvent: _follow.onMapEvent,
+      ),
+      children: [
+        MapTiles.layer(light: context.pal.isLight),
+        CircleLayer(
+          circles: [
+            MapAreas.incidentRadius(
+              context.pal,
+              centre,
+              metres: kAreaRadiusMetres,
+            ),
+          ],
+        ),
+        MarkerLayer(
+          rotate: true,
+          markers: [
+            for (final u in units)
+              if (u.at != null)
+                Marker(
+                  point: u.at!,
+                  width: MapMarker.target,
+                  height: MapMarker.target,
+                  child: MapMarker(kind: MapMarkerKind.unit, label: u.name),
+                ),
+            // Last, so a truck parked at the fire never hides it.
+            Marker(
+              point: centre,
+              width: MapMarker.target,
+              height: MapMarker.target,
+              child: MapMarker(
+                kind: MapMarkerKind.incident,
+                label: _area!.name,
+                selected: true,
+                live: true,
+              ),
+            ),
+          ],
+        ),
+        YouAreHereLayer(follow: _follow),
+        MapLocationButtons(
+          follow: _follow,
+          alignment: Alignment.topRight,
+          padding: EdgeInsets.only(
+            top: MediaQuery.paddingOf(context).top + 64,
+            right: 16,
+          ),
+        ),
+        MapTiles.attribution(),
+      ],
+    );
+  }
+
+  Widget _sheet(AreaView area, List<_Unit> units, ScrollController scroll) {
+    final pal = context.pal;
+    final accepted = area.at('verified_at');
+    final mine = _mine;
+    final going = units.length;
+    return ClipRRect(
+      borderRadius: const BorderRadius.vertical(
+        top: Radius.circular(AppRadius.sheet),
+      ),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 9, sigmaY: 9),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: pal.glassStrong,
+            border: Border(top: BorderSide(color: pal.line)),
+          ),
+          // The grip is frozen above the list: the rows scroll under it.
+          child: Column(
+            children: [
+              SheetGrip(
+                sheet: _sheetSize,
+                minSize: _sheetMin,
+                maxSize: _sheetMax,
+                padding: const EdgeInsets.fromLTRB(24, 14, 24, 12),
+              ),
+              Expanded(
+                child: ListView(
+                  controller: scroll,
+                  padding: EdgeInsets.fromLTRB(
+                    24,
+                    0,
+                    24,
+                    MediaQuery.paddingOf(context).bottom + 24,
+                  ),
+                  children: [
+                    Row(
+                      children: [
+                        LifecycleChip(area.status),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            [
+                              area.name,
+                              if (accepted != null)
+                                t('accepted {agoText}', {
+                                  'agoText': agoText(accepted),
+                                }),
+                            ].join(' · '),
+                            textAlign: TextAlign.right,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: context.type.caption.copyWith(
+                              color: pal.label,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Semantics(
+                      header: true,
+                      child: Text(
+                        going == 0
+                            ? t('NOBODY GOING YET')
+                            : going == 1
+                            ? t('1 UNIT RESPONDING')
+                            : t('{going} UNITS RESPONDING', {'going': going}),
+                        style: context.type.title,
+                      ),
+                    ),
+                    if (routingLabel(
+                          area.raw,
+                          agency: _agency,
+                          orgId: widget.me['primary_org_id'] as String?,
+                        )
+                        case final routed?) ...[
+                      const SizedBox(height: 8),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: Tag(routed, color: pal.ok, dot: true),
+                      ),
+                    ],
+                    const SizedBox(height: 12),
+                    LifecycleRail(status: area.status),
+                    const SizedBox(height: 12),
+                    // On scene: what is burning, asked until answered.
+                    if (area.onScene && area.asksFireType) ...[
+                      FireTypeRow(
+                        area: area,
+                        onPick: _powers.responds ? _pickFireType : null,
+                      ),
+                      const SizedBox(height: 12),
+                    ],
+                    for (final u in units) ...[
+                      _unitRow(u, area),
+                      const SizedBox(height: 12),
+                    ],
+                    ListRow(
+                      // Red while a request waits: on BFP to answer, or on BFP
+                      // for the coordinator who asked.
+                      leading: IconPlate(
+                        AppIcons.warning,
+                        tint: _asks.any((r) => r.waiting) ? pal.live : null,
+                      ),
+                      title: t('Alarm level'),
+                      subtitle: _alarmLine(area),
+                      trailing: RowValue(alarmWord(area.alarmLevel)),
+                      chevron: _powers.requestsAlarm || _powers.decidesAlarm,
+                      onTap:
+                          _busy ||
+                              !(_powers.requestsAlarm || _powers.decidesAlarm)
+                          ? null
+                          : _alarm,
+                    ),
+                    const SizedBox(height: 12),
+                    ListRow(
+                      leading: const IconPlate(AppIcons.description),
+                      title: t('Area details'),
+                      subtitle: t(
+                        'Where it is, confidence, summary and reports',
+                      ),
+                      chevron: true,
+                      onTap: _details,
+                    ),
+                    const SizedBox(height: 12),
+                    if (_powers.responds)
+                      ..._myActions(area, mine)
+                    else ...[
+                      // Directions only: nothing is recorded, as on a responder's
+                      // Area before they go.
+                      AppButton(
+                        t('Route to the fire'),
+                        run: true,
+                        icon: AppIcons.directions,
+                        onPressed: _route,
+                      ),
+                      const SizedBox(height: 10),
+                    ],
+                    if (_powers.marksFireOut)
+                      AppButton.secondary(
+                        t('Mark fire out'),
+                        busy: _busy,
+                        onPressed: _busy ? null : _fireOut,
+                      ),
+                    if (_powers.rejects &&
+                        (area.status == 'en_route' ||
+                            area.status == 'verified'))
+                      Center(
+                        child: TextLink(
+                          t('Reject this Area'),
+                          color: pal.live,
+                          onTap: _reject,
+                        ),
+                      ),
+                    if (!_powers.coordinates)
+                      InlineAlert(
+                        body: t(
+                          'You follow this Area here, and can get directions to '
+                          'it. Fire Volunteer and BFP coordinators and responders '
+                          'run the response: going, fire out and the report.',
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _myActions(AreaView area, Map<String, dynamic>? mine) {
+    if (mine == null) {
+      return [
+        AppButton(
+          t('I am going'),
+          run: true,
+          busy: _busy,
+          onPressed: _busy ? null : _go,
+        ),
+        const SizedBox(height: 10),
+      ];
+    }
+    return [
+      if (area.status != 'arrived') ...[
+        AppButton(
+          t('Mark arrived'),
+          run: true,
+          busy: _busy,
+          onPressed: _busy ? null : _arrived,
+        ),
+        const SizedBox(height: 10),
+      ],
+      AppButton.secondary(
+        t('Route to the fire'),
+        icon: AppIcons.directions,
+        onPressed: _route,
+      ),
+      const SizedBox(height: 10),
+    ];
+  }
+
+  Widget _unitRow(_Unit u, AreaView area) {
+    final pal = context.pal;
+    final centre = area.centre!;
+    final at = u.at;
+    final away = at == null ? null : metresBetween(at, centre);
+    final onScene =
+        (away != null && away <= _onSceneMetres) ||
+        (at == null && area.status == 'arrived');
+    final fixAt = parseTime(u.fix?['captured_at']);
+    final stale =
+        fixAt != null && DateTime.now().difference(fixAt).inSeconds > 30;
+    final moving = ((u.fix?['speed_mps'] as num?)?.toDouble() ?? 0) > 1;
+    final crew = u.crew.length;
+    final String subtitle;
+    if (onScene) {
+      subtitle = away == null
+          ? t('The Area is marked on scene')
+          : t('Within {_onSceneMetres} m of the fire', {
+              '_onSceneMetres': _onSceneMetres.round(),
+            });
+    } else if (away == null) {
+      subtitle = t('No location yet');
+    } else {
+      subtitle = [
+        t('{formatDistance} away', {'formatDistance': formatDistance(away)}),
+        if (stale)
+          t('last seen {agoText}', {'agoText': agoText(fixAt)})
+        else if (moving)
+          'moving',
+        if (!stale) t('updates every 5 s'),
+      ].join(' · ');
+    }
+    final tone = onScene ? pal.ok : (away == null ? pal.label : pal.info);
+    return ListRow(
+      leading: IconPlate(
+        AppIcons.fireTruck,
+        tint: away == null && !onScene ? null : tone,
+      ),
+      title: crew > 1
+          ? t('{name} · {crew} crew', {'name': u.name, 'crew': crew})
+          : u.name,
+      subtitle: subtitle,
+      trailing: RowValue(onScene ? t('On scene') : t('En route'), color: tone),
+    );
+  }
+}
+
+class _Unit {
+  _Unit({required this.name, required this.crew, required this.fix});
+
+  final String name;
+  final List<Map<String, dynamic>> crew;
+
+  /// The crew's newest GPS fix, if any.
+  final Map<String, dynamic>? fix;
+
+  LatLng? get at {
+    final f = fix;
+    if (f == null) return null;
+    return LatLng((f['lat'] as num).toDouble(), (f['lng'] as num).toDouble());
+  }
+}
+
+/// LIVE for one Area, opened over everything (from a notification, when the
+/// coordinator shell is not showing): the same view, with a Back.
+class LiveIncidentScreen extends StatelessWidget {
+  const LiveIncidentScreen({
+    super.key,
+    required this.areaId,
+    required this.me,
+    this.api,
+  });
+
+  final String areaId;
+  final Map<String, dynamic> me;
+  final ApiClient? api;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: context.pal.background,
+      body: Stack(
+        children: [
+          LiveIncidentView(areaId: areaId, me: me, api: api ?? ApiClient()),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: BackWell(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}

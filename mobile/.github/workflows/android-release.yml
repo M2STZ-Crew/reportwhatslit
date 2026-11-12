@@ -1,0 +1,243 @@
+# Build the Android app on GitHub's servers and hand it to the team through
+# Firebase App Distribution — no laptop involved. One-time setup: docs/ci-release.md
+name: Android release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  # "Run workflow" button on the Actions tab, for a rebuild without a code change.
+  workflow_dispatch:
+
+# The repository is public, and there is deliberately no pull_request trigger,
+# so a fork can never run with the secrets. Read-only by default; the job
+# below may write only to make the release "Check for updates" reads.
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The version the tested laptop build used.
+  FLUTTER_VERSION: "3.44.4"
+  # Firebase App Distribution target. A public identifier — it ships inside the APK.
+  FIREBASE_APP_ID: "1:147724922942:android:da6473b4219f07db9ca16f"
+  # SHA-256 of the certificate every build must be signed with: the debug key the
+  # app was first installed with. Android refuses to update an installed app from
+  # a build signed with a different key, so a mismatched build is never distributed.
+  EXPECTED_CERT_SHA256: "35220c1aa4353ae043aa32aae29bbe6e7707f00feb7f190c93a60a80798542e8"
+
+jobs:
+  build-and-distribute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # One write to the repository: the GitHub release "Check for updates"
+    # reads, made by the last step. Still no pull_request trigger, so only a
+    # push to main (or the Run workflow button) can run it.
+    permissions:
+      contents: write
+    steps:
+      - name: Check the secrets and variables are set
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          REPLIT_API_BASE: ${{ vars.REPLIT_API_BASE }}
+          FIREBASE_TESTER_GROUPS: ${{ vars.FIREBASE_TESTER_GROUPS }}
+        run: |
+          missing=()
+          for name in DEBUG_KEYSTORE_BASE64 GOOGLE_SERVICES_JSON MAPBOX_TOKEN FIREBASE_SERVICE_ACCOUNT_JSON; do
+            [ -n "${!name}" ] || missing+=("secret $name")
+          done
+          for name in REPLIT_API_BASE FIREBASE_TESTER_GROUPS; do
+            [ -n "${!name}" ] || missing+=("variable $name")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Not set: ${missing[*]}. See docs/ci-release.md."
+            exit 1
+          fi
+          case "$REPLIT_API_BASE" in
+            https://*) ;;
+            *)
+              echo "::error::REPLIT_API_BASE must start with https:// — release builds block plain http."
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Check the signing key before building
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          # The release build signs with the debug signing config
+          # (android/app/build.gradle.kts), which reads debug.keystore from the
+          # Android user home. The Android tools quietly generate a brand-new key
+          # when they find none there, and the build still succeeds — so name the
+          # directory explicitly instead of trusting the runner's default, and
+          # export it so the build step reads the same file.
+          android_user_home="$RUNNER_TEMP/android-user-home"
+          mkdir -p "$android_user_home" "$HOME/.android"
+          keystore="$android_user_home/debug.keystore"
+          printf '%s' "$DEBUG_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          cp "$keystore" "$HOME/.android/debug.keystore"
+          echo "ANDROID_USER_HOME=$android_user_home" >> "$GITHUB_ENV"
+
+          # Fail in seconds rather than after a five-minute build. A certificate
+          # fingerprint is public, so printing it is safe.
+          fingerprint=$(keytool -list -v -keystore "$keystore" -alias androiddebugkey \
+            -storepass android 2>/dev/null | sed -n 's/^[[:space:]]*SHA256: //p' | head -1 || true)
+          fingerprint=$(printf '%s' "$fingerprint" | tr -d ':' | tr '[:upper:]' '[:lower:]')
+          if [ -z "$fingerprint" ]; then
+            echo "::error::DEBUG_KEYSTORE_BASE64 is not a readable Android debug keystore. Copy it again with the command in docs/ci-release.md."
+            exit 1
+          fi
+          if [ "$fingerprint" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "::error::DEBUG_KEYSTORE_BASE64 holds a different key ($fingerprint). Copy it again on the laptop whose key is $EXPECTED_CERT_SHA256 — see docs/ci-release.md."
+            exit 1
+          fi
+          echo "The secret holds the key the installed app was signed with."
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install packages
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
+
+      - name: Write the build configuration from secrets
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          MAPBOX_TOKEN: ${{ secrets.MAPBOX_TOKEN }}
+          REPLIT_API_BASE: ${{ vars.REPLIT_API_BASE }}
+        run: |
+          # Push notifications (FCM). Without it the app still builds, silently without push.
+          printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+
+          # Trailing slashes are dropped: "https://host/" would build
+          # "https://host//auth/login", which the API answers with a 404.
+          jq -n \
+            --arg mapbox "$MAPBOX_TOKEN" \
+            --arg api "${REPLIT_API_BASE%/}" \
+            '{MAPBOX_TOKEN: $mapbox, REPLIT_API_BASE: $api}' \
+            > env.json
+
+      - name: Build the APK
+        # Build numbers rise with every run, so each build installs over the last one.
+        run: >-
+          flutter build apk --release
+          --dart-define-from-file=env.json
+          --build-number=${{ github.run_number }}
+
+      - name: Check the signature and the compiled-in backend
+        env:
+          REPLIT_API_BASE: ${{ vars.REPLIT_API_BASE }}
+        run: |
+          apk=build/app/outputs/flutter-apk/app-release.apk
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
+          actual=$("$apksigner" verify --print-certs "$apk" \
+            | sed -n 's/.*certificate SHA-256 digest: //p' | head -1)
+          if [ "$actual" != "$EXPECTED_CERT_SHA256" ]; then
+            # The key itself was checked before the build, so reaching here means
+            # the build did not read it and generated a key of its own.
+            echo "::error::The APK is signed with $actual, not the key checked before the build. The build did not read debug.keystore from $ANDROID_USER_HOME."
+            exit 1
+          fi
+
+          # Without --dart-define-from-file the build still succeeds, pointed at an
+          # emulator address. Refuse to ship that.
+          host="${REPLIT_API_BASE#https://}"
+          host="${host%%/*}"
+          if ! unzip -p "$apk" lib/arm64-v8a/libapp.so | grep -a -q -F "$host"; then
+            echo "::error::$host is not compiled into the app, so env.json was not applied."
+            exit 1
+          fi
+          echo "Signed with the expected key and compiled against $host."
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Send to the team
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          FIREBASE_TESTER_GROUPS: ${{ vars.FIREBASE_TESTER_GROUPS }}
+        run: |
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/firebase-service-account.json"
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT_JSON" > "$GOOGLE_APPLICATION_CREDENTIALS"
+          # Written to a file, never interpolated into the command, so a commit
+          # message cannot inject shell. The whole message, not only its first
+          # line: a release merge carries what changed, in testers' words. The
+          # co-author trailer is for the history, not for testers.
+          git log -1 --pretty='Build ${{ github.run_number }} (%h)%n%n%B' |
+            grep -v '^Co-Authored-By:' > "$RUNNER_TEMP/release-notes.txt"
+          npx --yes firebase-tools@15.30.0 appdistribution:distribute \
+            build/app/outputs/flutter-apk/app-release.apk \
+            --app "$FIREBASE_APP_ID" \
+            --groups "$FIREBASE_TESTER_GROUPS" \
+            --release-notes-file "$RUNNER_TEMP/release-notes.txt"
+
+      # "Check for updates" in the app (lib/updates/app_updates.dart) reads the
+      # newest release's latest.json and downloads the APK beside it, so people
+      # without a Firebase tester invitation get updates too. The APK holds no
+      # secret: the Mapbox token is a public pk. token, and the Firebase config
+      # is made to ship inside apps. A re-run keeps its run number, so it
+      # replaces the files on its own release rather than failing.
+      - name: Publish on GitHub Releases, for "Check for updates"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -nE 's/^version: *([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' pubspec.yaml)
+          build="${{ github.run_number }}"
+          tag="android-v$version-$build"
+          apk="RepLiT-$version-$build.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "$RUNNER_TEMP/$apk"
+          size=$(stat -c %s "$RUNNER_TEMP/$apk")
+          sha256=$(sha256sum "$RUNNER_TEMP/$apk" | cut -d ' ' -f 1)
+          jq -n \
+            --arg version "$version" --argjson build "$build" \
+            --arg tag "$tag" --arg apk "$apk" \
+            --argjson size "$size" --arg sha256 "$sha256" \
+            --rawfile notes "$RUNNER_TEMP/release-notes.txt" \
+            '{version: $version, build: $build, tag: $tag, apk: $apk, size: $size, sha256: $sha256, notes: $notes}' \
+            > "$RUNNER_TEMP/latest.json"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$tag" "$RUNNER_TEMP/$apk" "$RUNNER_TEMP/latest.json" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "$RUNNER_TEMP/$apk" "$RUNNER_TEMP/latest.json" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "RepLiT $version ($build)" \
+              --notes-file "$RUNNER_TEMP/release-notes.txt" \
+              --latest
+          fi
+          echo "Published $apk ($size bytes) on release $tag."
+
+      - name: Remove the secret files
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/android-user-home"
+          rm -f "$RUNNER_TEMP/firebase-service-account.json" \
+                android/app/google-services.json \
+                env.json \
+                "$HOME/.android/debug.keystore"

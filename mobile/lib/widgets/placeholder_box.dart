@@ -1,0 +1,58 @@
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import '../theme.dart';
+import 'app_icons.dart';
+
+/// A neutral placeholder for images, logos, avatars, etc.
+class PlaceholderBox extends StatelessWidget {
+  const PlaceholderBox({
+    super.key,
+    this.width = 120,
+    this.height = 120,
+    this.label = 'IMAGE',
+    this.icon = AppIcons.image,
+    this.radius = 16,
+  });
+
+  final double width;
+  final double height;
+  final String label;
+  final IconData icon;
+  final double radius;
+
+  @override
+  Widget build(BuildContext context) {
+    // A box told to fill its parent (double.infinity) takes its icon size from
+    // the side that is finite, or a default. An infinite icon cannot be laid
+    // out: the captain's incident screen used to fail this way whenever a
+    // report's photo was missing or would not load.
+    final finite = [width, height].where((v) => v.isFinite);
+    final side = finite.isEmpty ? 120.0 : finite.reduce(math.min);
+    return Container(
+      width: width,
+      height: height,
+      decoration: BoxDecoration(
+        color: context.pal.glassDim,
+        borderRadius: BorderRadius.circular(radius),
+        border: Border.all(color: context.pal.line),
+      ),
+      // FittedBox because a placeholder is often given a small fixed box; at a
+      // large system font scale the label would otherwise overflow it.
+      child: FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: context.pal.faint, size: side * 0.28),
+            if (label.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(label, style: context.type.eyebrow),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}

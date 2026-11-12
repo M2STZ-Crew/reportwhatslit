@@ -1,0 +1,244 @@
+import 'package:flutter/material.dart';
+
+import '../models/guide_article.dart';
+import '../theme.dart';
+import '../widgets/app_nav_bar.dart';
+import '../widgets/design.dart';
+import 'guide_detail_screen.dart';
+import '../widgets/app_icons.dart';
+import '../i18n/i18n.dart';
+
+/// "13 Guides" from the REPLIT-OVERHAUL Figma — "Safety guides".
+///
+/// The design's argument for this screen is that the guide you need is
+/// already open when you arrive: nobody browses a list while their kitchen is
+/// alight. So the top card is the "Start here" guide — the one for while it
+/// is happening — with its first steps on screen, and every other guide is a
+/// plain list beneath it. The overhaul drops v2's search and category chips;
+/// with this many guides one list is quicker than either.
+///
+/// The frame's list names guides this knowledge base does not have (CPR,
+/// choking, earthquake…). They are not written here from a mock-up: safety
+/// and first-aid steps need someone to vouch for them first.
+class GuideScreen extends StatelessWidget {
+  const GuideScreen({super.key});
+
+  void _open(BuildContext context, GuideArticle article) {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => GuideDetailScreen(article: article)),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final featured = kGuideArticles.firstWhere(
+      (g) => g.startHere,
+      orElse: () => kGuideArticles.first,
+    );
+    final rest = kGuideArticles.where((g) => g != featured).toList();
+
+    return Scaffold(
+      backgroundColor: context.pal.background,
+      bottomNavigationBar: const AppNavBar(active: AppTab.guides),
+      body: SafeArea(
+        bottom: false,
+        // The list fades at whichever edge has more past it (04 · Scroll
+        // fade), instead of a gradient that never moves.
+        child: ScrollFade(
+          child: ListView(
+            padding: const EdgeInsets.fromLTRB(24, 12, 24, 48),
+            children: [
+              ScreenHeader(
+                eyebrow: t('Knowledge base'),
+                title: t('Safety guides'),
+                showBack: false,
+                trailing: AvatarWell(
+                  onTap: () => AppNavBar.switchTo(context, AppTab.profile),
+                ),
+              ),
+              const SizedBox(height: 22),
+              Text(
+                t('Short steps to follow while help is on the way.'),
+                style: context.type.body,
+              ),
+              const SizedBox(height: 32),
+              _FeaturedGuide(
+                article: featured,
+                onTap: () => _open(context, featured),
+              ),
+              const SizedBox(height: 32),
+              Row(
+                children: [
+                  Expanded(
+                    child: Eyebrow(t('All guides'), color: context.pal.accent),
+                  ),
+                  Eyebrow(
+                    t('{n} lessons', {'n': kGuideArticles.length}),
+                    color: context.pal.muted,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 18),
+              for (final g in rest) ...[
+                _GuideRow(article: g, onTap: () => _open(context, g)),
+                const SizedBox(height: 8),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// "Start here · 2 min read": the guide open before it is opened.
+class _FeaturedGuide extends StatelessWidget {
+  const _FeaturedGuide({required this.article, required this.onTap});
+
+  final GuideArticle article;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final fire = article.category == kCatFire;
+    final steps = article.firstSteps;
+    return Semantics(
+      button: true,
+      label: t('Start here: {title}. Open the full guide.', {
+        'title': t(article.title),
+      }),
+      child: Panel(
+        padding: const EdgeInsets.all(20),
+        border: context.pal.accent.withValues(alpha: 0.45),
+        gradient: LinearGradient(
+          begin: const Alignment(-0.27, -1),
+          end: const Alignment(0.27, 1),
+          stops: const [0.12, 0.87],
+          colors: [
+            context.pal.accent.withValues(alpha: 0.13),
+            context.pal.live.withValues(alpha: 0.06),
+          ],
+        ),
+        onTap: onTap,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    // DAWI "12 GUIDES": the coral's deep well, a white glyph.
+                    color: context.pal.wellFor(context.pal.accent),
+                    borderRadius: BorderRadius.circular(AppRadius.control),
+                  ),
+                  alignment: Alignment.center,
+                  child: fire
+                      ? Image.asset(Art.incident, width: 20, height: 20)
+                      : Icon(
+                          article.icon,
+                          size: 20,
+                          color: context.pal.glyphOn(context.pal.accent),
+                        ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        t('START HERE · {n} MIN READ', {'n': article.readMins}),
+                        style: context.type.tag.copyWith(
+                          color: context.pal.accent,
+                        ),
+                      ),
+                      const SizedBox(height: 5),
+                      Text(
+                        t(article.title).toUpperCase(),
+                        style: context.type.headline,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            for (final (i, step) in steps.indexed) ...[
+              if (i > 0) const SizedBox(height: 9),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SizedBox(
+                    width: 13,
+                    child: Text(
+                      '${i + 1}',
+                      style: context.type.labelSm.copyWith(
+                        color: context.pal.accent,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 11),
+                  Expanded(
+                    child: Text(
+                      t(step),
+                      style: context.type.detail.copyWith(
+                        color: context.pal.textSoft,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GuideRow extends StatelessWidget {
+  const _GuideRow({required this.article, required this.onTap});
+
+  final GuideArticle article;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: t('{title}, {n} minute read', {
+        'title': t(article.title),
+        'n': article.readMins,
+      }),
+      excludeSemantics: true,
+      child: Panel(
+        radius: AppRadius.control,
+        padding: const EdgeInsets.fromLTRB(18, 18, 16, 18),
+        onTap: onTap,
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                t(article.title),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: context.type.rowValue.copyWith(
+                  color: context.pal.onBackground,
+                ),
+              ),
+            ),
+            const SizedBox(width: 14),
+            Text(
+              t('{n} MIN', {'n': article.readMins}),
+              style: context.type.tag.copyWith(color: context.pal.muted),
+            ),
+            const SizedBox(width: 14),
+            Icon(AppIcons.chevronRight, size: 16, color: context.pal.muted),
+          ],
+        ),
+      ),
+    );
+  }
+}

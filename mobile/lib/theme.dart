@@ -1,0 +1,1018 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+/// Design tokens from the "General User App v2" hand-off (Claude Design).
+///
+/// The rules the design holds to, which everything below encodes:
+///   * one ground (#131313) with elevation expressed by translucent surfaces,
+///     never by a lighter solid colour;
+///   * every card edge is a 1px hairline, never a shadow;
+///   * coral is the only accent, and glow is reserved for two moments — the
+///     splash mark and the SOS button. Everywhere else it is flat;
+///   * red (#FF544E) means live or destructive, green (#22C55E) means settled.
+///
+/// The v1 token names are all still here so the screens that have not been
+/// reworked yet keep compiling — their values have simply moved to v2.
+///
+/// The citizen screens' dark palette ([AppPalette.dark]) and the agency
+/// colours now follow the REPLIT x DAWI Figma (file yTInpc7mWlTug0PQzKiW0L,
+/// page DESIGN SYSTEM): solid #1D1D1D cards on #424242 hairlines, violet
+/// police, teal medical, amber barangay, and each agency's 900 shade as the
+/// well behind its glyph.
+class AppColors {
+  AppColors._();
+
+  // ── ground ──────────────────────────────────────────────────────────────
+  /// Behind a camera viewfinder. Dark in both themes: a viewfinder is a
+  /// camera surface, and the light frames keep it dark (LIGHT frame 08).
+  static const Color canvas = Color(0xFF0B0B0B);
+
+  /// The screen background. Was #171717 in v1.
+  static const Color background = Color(0xFF131313);
+
+  // The ground below follows the REPLIT x DAWI dark palette too, so the staff
+  // screens that draw with these constants match the citizen screens drawn
+  // from [AppPalette.dark]: solid SURFACE/grey-500 cards on BACKGROUND/grey-400
+  // hairlines instead of the overhaul's translucent glass.
+
+  /// Sheets, the nav bar, and anything that must be opaque over the map.
+  static const Color surfaceSolid = Color(0xFF131313);
+
+  /// Panels and placeholders.
+  static const Color surface = Color(0xFF1D1D1D);
+  static const Color glass = Color(0xFF1D1D1D);
+  static const Color glassDim = Color(0xFF1D1D1D);
+
+  /// The raised pill behind the selected nav tab.
+  static const Color raised = Color(0xFF303030);
+
+  static const Color inputBg = Color(0xFF131313); // text field fill
+  static const Color inputBorder = Color(0xFF686868); // color/border/default
+
+  // ── hairlines ───────────────────────────────────────────────────────────
+  // REPLIT (MAIN) pass 4 tokens (03 · Semantic colour tokens): card edges are
+  // the PRD's translucent hairline, and anything a person operates — a field,
+  // a checkbox, a switch track, a secondary button, an unfilled progress
+  // track — gets the 3 : 1 control border instead, because a hairline is too
+  // faint (1.2 : 1) to show where a control begins.
+  static const Color line = Color(0x59484847); // color/border/subtle
+  static const Color lineStrong = Color(0xFF686868); // color/border/default
+  static const Color lineLight = Color(0x80ADAAAA);
+  static const Color outline = Color(0x33FFFFFF);
+
+  // ── ink ─────────────────────────────────────────────────────────────────
+  static const Color onBackground = Color(0xFFF3F3F3); // color/text/primary
+  static const Color textSoft = Color(0xFFC9C9C9); // color/text/secondary
+  static const Color label = Color(0xFFA1A1A1); // color/text/tertiary
+  static const Color muted = Color(0xFF8A8A8A); // color/text/muted
+
+  /// What an empty field says it is waiting for: color/text/muted, the
+  /// least-emphasis grey that still reads (4.9 : 1).
+  static const Color placeholder = Color(0xFF8A8A8A);
+
+  /// Was TEXT/grey-600 (#7E7E7E, 4.1 : 1). Pass 4 retires the greys below
+  /// text/muted for anything a person reads, so it is muted now.
+  static const Color faint = Color(0xFF8A8A8A);
+  static const Color darkText = Color(0xFF767575); // input placeholders
+
+  // ── accent ──────────────────────────────────────────────────────────────
+  static const Color gradientStart = Color(0xFFFF9066);
+
+  /// v2 moves the button gradient's far stop from #EB4800 to #FF7943 — a
+  /// shorter, warmer ramp. The old deep orange survives as [ember], which the
+  /// design still uses for the "connected · location on" dot.
+  static const Color gradientEnd = Color(0xFFFF7943);
+  static const Color ember = Color(0xFFEB4800);
+
+  static const Color accent = Color(0xFFFF9066);
+
+  /// The wash behind a coral icon in a well. Named because it appears in
+  /// every list row in the app.
+  static const Color accentTint = Color(0x26FF9066);
+
+  /// Text on the coral gradient. Dark brown, not black — it is what keeps the
+  /// primary button from reading as a warning.
+  static const Color accentText = Color(0xFF581A00);
+
+  /// color/brand/primary-solid: the filled check badge on a selected Choice
+  /// row (04 · pass 6), the same step the incident marker surface uses.
+  static const Color accentSolid = markerIncident;
+
+  // ── meaning ─────────────────────────────────────────────────────────────
+  static const Color live = Color(0xFFFF544E); // active incident, destructive
+  static const Color ok = Color(0xFF22C55E); // resolved, verified, ready
+  static const Color warn = Color(0xFFFFB020); // color/status/warning
+
+  // Map layer colours (color/map/*): the layer chips' dots and tints, and the
+  // Area radius.
+  static const Color markerWater = Color(
+    0xFF5B93F5,
+  ); // hydrants, cisterns, water
+  static const Color markerShelter = Color(0xFF22C55E); // evacuation sites
+  static const Color markerShelterEdge = Color(0x6622C55E);
+  static const Color markerPlate = Color(0xFF201E1C); // neutral: hospital
+  static const Color markerLive = Color(0xFFE5342E); // a live incident
+  static const Color markerYou = Color(0xFFFFA685); // color/map/you
+  static const Color markerEdge = Color(0xFFCFCFCF); // Neutral/Marker
+
+  // Map marker surfaces (pass 3, color/map/marker-surface-*): the 700 step of
+  // each category colour, so the white glyph on it measures 3.55–7.23 : 1.
+  // The bright 500s fail under a white glyph (1.8–3.2 : 1).
+  static const Color markerIncident = Color(0xFFB56648);
+  static const Color markerRisk = Color(0xFFB53C37);
+  static const Color markerShelterSurface = Color(0xFF188C43);
+  static const Color markerWaterSurface = Color(0xFF4168AE);
+  static const Color markerPolice = Color(0xFF6341AF);
+  static const Color markerMedical = Color(0xFF0E8376);
+  static const Color markerBarangay = Color(0xFFB57D17);
+  static const Color markerUnit = Color(0xFF626262);
+
+  // Materials (pass 2): Glass for floating map UI with short bold labels,
+  // Glass strong for anything over a map that carries body text, and the
+  // scrim behind a modal.
+  static const Color glassOverlay = Color(0x80131313); // color/surface/glass
+  static const Color glassStrong = Color(
+    0xE0131313,
+  ); // color/surface/glass-strong
+  static const Color scrim = Color(0xA3000000); // color/surface/scrim
+
+  // Interaction states from the COMPONENTS page. Hover and pressed are a
+  // token overlay laid over the same fill, so a theme change carries them;
+  // focus is a ring drawn outside the control, never a fill change.
+  static const Color hover = Color(0x0FFFFFFF); // white 6%
+  static const Color pressed = Color(0x1FFFFFFF); // white 12%
+  static const Color focusRing = Color(0xE6FF9066); // coral 90%
+
+  /// What a disabled control fades to (COMPONENTS: every disabled state).
+  static const double disabledOpacity = 0.38;
+  static const Color info = Color(0xFF5B93F5); // color/status/info
+
+  // ── agencies (REPLIT x DAWI Figma, "ACCENT/*" 500s) ─────────────────────
+  static const Color fire = Color(0xFFFF544E); // ACCENT/RISK ZONES red-500
+  static const Color medical = Color(0xFF14B8A6); // ACCENT/MEDICAL green-500
+  /// color/agency/police — violet-300. Violet-500 (#8B5CF6) measures 3.98 : 1
+  /// on a card and 2.98 : 1 on its own plate, so text and icons take the
+  /// lighter step; the plate behind them stays [wellPolice].
+  static const Color police = Color(0xFFB192F9);
+  static const Color barangay = Color(0xFFFFB020); // ACCENT/BARANGAY orange-500
+  static const Color coastguard = Color(0xFF2DD4BF);
+
+  /// Police markers and hotlines. The DAWI design makes police violet again
+  /// (it was blue in the overhaul), so this still simply names [police].
+  static const Color crime = police;
+
+  /// The deep well an agency's white glyph sits on — each accent's 900 shade
+  /// from the DAWI colour sheet (orange-900 behind fire, and so on).
+  static const Color wellFire = Color(0xFF6B3C2B); // PRIMARY/orange-900
+  static const Color wellPolice = Color(0xFF3A2767); // ACCENT/POLICE blue-900
+  static const Color wellMedical = Color(
+    0xFF084D46,
+  ); // ACCENT/MEDICAL green-900
+  static const Color wellBarangay = Color(
+    0xFF6B4A0D,
+  ); // ACCENT/BARANGAY orange-900
+  static const Color wellShelter = Color(
+    0xFF0E5327,
+  ); // ACCENT/SHELTER green-900
+
+  static const LinearGradient accentGradient = LinearGradient(
+    begin: Alignment.topCenter,
+    end: Alignment.bottomCenter,
+    colors: [gradientStart, gradientEnd],
+  );
+
+  /// The SOS button runs the same two stops on a diagonal.
+  static const LinearGradient sosGradient = LinearGradient(
+    begin: Alignment.topLeft,
+    end: Alignment.bottomRight,
+    colors: [gradientStart, Color(0xFFFF734E)],
+  );
+
+  /// One colour per public.area_status value — the Lifecycle chip's tones
+  /// (REPLIT (MAIN) 04, pass 4): amber needs a decision or a record, blue is
+  /// verified, red is under way, green is out, and grey has left the live
+  /// feed. v11 dropped 'dispatched': Accept carries an incident from Reported
+  /// straight to En route, so there is no step between them to colour.
+  ///
+  /// The web consoles still draw the v11 colours; PRD §8.1 wants the three
+  /// token files in step, so they follow in their own change.
+  static Color forStatus(String? status) => switch (status) {
+    'reported' || 'post_incident_report' => warn,
+    'verified' => info,
+    'en_route' || 'arrived' => live,
+    'fire_out' => ok,
+    'closed' || 'rejected' || 'merged' => textSoft,
+    _ => muted,
+  };
+
+  /// Agency accent, matching the agency rows in the design. Fire volunteers
+  /// keep the coral — they are this app's own crews — and BFP takes the
+  /// design's fire red.
+  static Color forAgency(String? agency) => switch (agency) {
+    'fire_volunteer' => accent,
+    'bfp' => fire,
+    'police' => police,
+    'medical' => medical,
+    'barangay' => barangay,
+    'coastguard' => coastguard,
+    _ => muted,
+  };
+}
+
+/// Corner radii the design uses. Nothing in the hand-off is square and nothing
+/// is a stadium — everything is one of these four.
+/// The two grounds the design ships: the dark one the app has always drawn,
+/// and the light one from "GENERAL USER — MOBILE v2 · LIGHT".
+///
+/// The light values are not invented. The Figma resolves its colour variables
+/// to the dark mode over the API, so each one here was read off the rendered
+/// light frames by comparing them against the dark frames pixel for pixel —
+/// four screens' worth, which agreed to the byte.
+///
+/// Two things deliberately do not change between themes: the coral gradient a
+/// primary button is filled with, and the dark brown that sits on it. A button
+/// that means "send help" should look the same in both.
+@immutable
+class AppPalette extends ThemeExtension<AppPalette> {
+  const AppPalette({
+    required this.brightness,
+    required this.canvas,
+    required this.background,
+    required this.surfaceSolid,
+    required this.surface,
+    required this.glass,
+    required this.glassDim,
+    required this.raised,
+    required this.inputBg,
+    required this.line,
+    required this.lineStrong,
+    required this.onBackground,
+    required this.textSoft,
+    required this.label,
+    required this.muted,
+    required this.placeholder,
+    required this.faint,
+    required this.accent,
+    required this.accentInk,
+    required this.live,
+    required this.ok,
+    required this.warn,
+    required this.lineLight,
+    required this.hover,
+    required this.pressed,
+  });
+
+  final Brightness brightness;
+
+  // ground
+  final Color canvas;
+  final Color background;
+  final Color surfaceSolid;
+  final Color surface;
+  final Color glass;
+  final Color glassDim;
+  final Color raised;
+  final Color inputBg;
+
+  // edges
+  final Color line;
+  final Color lineStrong;
+
+  // type
+  final Color onBackground;
+  final Color textSoft;
+  final Color label;
+  final Color muted;
+  final Color placeholder;
+  final Color faint;
+
+  /// The accent as a fill — the gradient's head, unchanged in both themes.
+  final Color accent;
+
+  /// The accent as ink: coral is unreadable as text on a light ground, so the
+  /// light theme darkens it to #A63A0A for labels, icons and strokes.
+  final Color accentInk;
+
+  final Color live;
+  final Color ok;
+  final Color warn;
+
+  /// The brighter hairline the design uses on a photo or a map.
+  final Color lineLight;
+
+  /// Hover and pressed are an overlay over whatever is underneath: white on
+  /// the dark ground, black on the light one, so both read as pressure.
+  final Color hover;
+  final Color pressed;
+
+  /// The focus ring — the accent at 90%, drawn outside the control.
+  Color get focusRing => accentInk.withValues(alpha: 0.9);
+
+  bool get isLight => brightness == Brightness.light;
+
+  /// The accent as a wash behind an icon or a selected chip.
+  Color get accentTint => accentInk.withValues(alpha: 0.15);
+
+  /// A hairline drawn over a photo or a map, where the ground is unknown.
+  Color get outline =>
+      isLight ? const Color(0x33000000) : const Color(0x33FFFFFF);
+
+  /// Informational blue — never a status on its own, only a marker tint
+  /// (color/status/info).
+  Color get info => isLight ? const Color(0xFF5386DF) : AppColors.info;
+
+  /// Agency colours. The dark values are the DAWI design's 500s; the light
+  /// ones are the Figma's light mode (color/agency/*), where it has them.
+  Color get fire => live;
+  Color get medical => isLight ? const Color(0xFF0B655B) : AppColors.medical;
+  Color get police => isLight ? const Color(0xFF6341AF) : AppColors.police;
+  Color get barangay => isLight ? const Color(0xFF8C6112) : AppColors.barangay;
+  Color get coastguard =>
+      isLight ? const Color(0xFF0E6E66) : const Color(0xFF2DD4BF);
+  Color get crime => police;
+
+  /// Water on the map — hydrants, cisterns, bodies of water (color/map/water).
+  Color get water => isLight ? const Color(0xFF4168AE) : AppColors.markerWater;
+
+  /// The well behind a white glyph in a list row, for a row tinted [tint].
+  ///
+  /// The DAWI design fills each well with its accent's 900 shade — a deep,
+  /// solid brown behind fire, violet behind police — rather than a wash of the
+  /// accent, and draws the glyph white on it. A tint the colour sheet has no
+  /// 900 for gets the same depth by laying the accent over the card colour.
+  /// The light theme draws its glyphs in the tint, on the Figma's light
+  /// plates where it has one (color/agency/*-plate), else a wash.
+  Color wellFor(Color tint) {
+    if (isLight) {
+      if (tint == accent || tint == accentInk) return const Color(0xFFFFDDD0);
+      if (tint == police) return const Color(0xFFDBCCFC);
+      if (tint == medical) return const Color(0xFFB6E9E3);
+      return tint.withValues(alpha: 0.16);
+    }
+    if (tint == accent || tint == accentInk) return AppColors.wellFire;
+    if (tint == police) return AppColors.wellPolice;
+    if (tint == medical) return AppColors.wellMedical;
+    if (tint == barangay) return AppColors.wellBarangay;
+    if (tint == ok) return AppColors.wellShelter;
+    return Color.alphaBlend(tint.withValues(alpha: 0.32), surface);
+  }
+
+  /// What a glyph in a [wellFor] well is drawn in: white on the deep dark
+  /// wells, the tint itself on the light theme's wash.
+  Color glyphOn(Color tint) => isLight ? tint : Colors.white;
+
+  /// What an incident's status looks like in this theme: the Lifecycle
+  /// chip's tones (see [AppColors.forStatus]).
+  Color forStatus(String? status) => switch (status) {
+    'reported' || 'post_incident_report' => warn,
+    'verified' => info,
+    'en_route' || 'arrived' => live,
+    'fire_out' => ok,
+    'closed' || 'rejected' || 'merged' => textSoft,
+    _ => muted,
+  };
+
+  /// The tint behind a status word: 12 % for live, 14 % for the others, and
+  /// the hover overlay for the grey statuses that have left the live feed
+  /// (04 · Status badge).
+  Color statusTint(Color tone) => tone == textSoft
+      ? hover
+      : tone.withValues(alpha: tone == live ? 0.12 : 0.14);
+
+  // Materials (03 · pass 2). Glass is for floating map UI with short bold
+  // labels; Glass strong for anything over a map that carries body text.
+  // Light: color/surface/glass, glass-strong and scrim in light mode.
+  Color get glassOverlay =>
+      isLight ? const Color(0xD6FFFFFF) : AppColors.glassOverlay;
+  Color get glassStrong =>
+      isLight ? const Color(0xF0FFFFFF) : AppColors.glassStrong;
+  Color get scrim => isLight ? const Color(0x7A17140F) : AppColors.scrim;
+
+  /// The viewer's own position on a map (color/map/you).
+  Color get you => isLight ? const Color(0xFFE8835D) : AppColors.markerYou;
+
+  /// Which agency an incident asked for.
+  Color forAgency(String? agency) => switch (agency) {
+    'fire_volunteer' => accentInk,
+    'bfp' => fire,
+    'police' => police,
+    'medical' => medical,
+    'barangay' => barangay,
+    'coastguard' => coastguard,
+    _ => muted,
+  };
+
+  /// Kept for the v1 screens: the grey an unfilled field's text used.
+  Color get darkText => placeholder;
+
+  /// The gradient's ends, for anything that needs them apart.
+  Color get gradientStart => AppColors.gradientStart;
+  Color get gradientEnd => AppColors.gradientEnd;
+
+  /// The coral gradient. The same in both themes, by design.
+  LinearGradient get accentGradient => AppColors.accentGradient;
+
+  /// Text on the coral gradient.
+  Color get accentText => AppColors.accentText;
+
+  /// The REPLIT x DAWI dark ground ("GENERAL USER - DARK"). Cards are solid
+  /// SURFACE/grey-500 edged in BACKGROUND/grey-400, not the overhaul's
+  /// translucent glass; the ground and the tab bar are BACKGROUND/grey-500.
+  static const AppPalette dark = AppPalette(
+    brightness: Brightness.dark,
+    canvas: Color(0xFF0B0B0B),
+    background: Color(0xFF131313), // BACKGROUND/grey-500
+    surfaceSolid: Color(0xFF131313), // the tab bar, sheets over the map
+    surface: Color(0xFF1D1D1D), // SURFACE/grey-500
+    glass: Color(0xFF1D1D1D), // every card and row
+    glassDim: Color(0xB31D1D1D),
+    raised: Color(0xFF303030),
+    inputBg: Color(0xFF131313),
+    line: AppColors.line, // color/border/subtle
+    lineStrong: AppColors.lineStrong, // color/border/default
+    onBackground: AppColors.onBackground, // color/text/primary
+    textSoft: Color(0xFFC9C9C9), // TEXT/grey-200
+    label: AppColors.label, // color/text/tertiary
+    muted: Color(0xFF8A8A8A), // TEXT/grey-500
+    placeholder: AppColors.placeholder,
+    faint: AppColors.faint,
+    accent: Color(0xFFFF9066),
+    accentInk: Color(0xFFFF9066),
+    live: Color(0xFFFF544E),
+    ok: Color(0xFF22C55E),
+    warn: AppColors.warn, // color/status/warning
+    lineLight: Color(0x80ADAAAA),
+    hover: Color(0x0FFFFFFF),
+    pressed: Color(0x1FFFFFFF),
+  );
+
+  /// The light ground, from REPLIT (MAIN)'s light-mode variables (pass 7,
+  /// 3 November 2026; read 12 November off the "· LIGHT" frames, where
+  /// mode/is-light is true). It used to be sampled off rendered pixels,
+  /// before the Figma had a light mode of its own.
+  static const AppPalette light = AppPalette(
+    brightness: Brightness.light,
+    // A viewfinder stays dark on the light ground — the design's light Report
+    // frame draws the photo area in the dark ground colour.
+    canvas: Color(0xFF131313),
+    background: Color(0xFFF6F5F3), // color/background/ground
+    surfaceSolid: Color(0xFFF6F5F3), // the ground, as dark's surfaceSolid is
+    surface: Color(0xFFFFFFFF), // color/surface/default
+    glass: Color(0xFFFFFFFF), // every card and row
+    glassDim: Color(0xFFF0EEEB), // color/surface/subtle
+    raised: Color(0xFFE5E4E1),
+    inputBg: Color(0xFFECEAE6), // color/surface/inset
+    line: Color(0x1F17140F), // color/border/subtle
+    lineStrong: Color(0xFF8A847E), // color/border/default — 3 : 1 controls
+    onBackground: Color(0xFF1A1817), // color/text/primary
+    textSoft: Color(0xFF45403C), // color/text/secondary
+    label: Color(0xFF5C5752), // color/text/tertiary
+    muted: Color(0xFF66615C), // color/text/muted
+    placeholder: Color(0xFF66615C), // as dark: the muted grey
+    faint: Color(0xFF66615C),
+    // On a pale ground the coral is the ink's job no more: color/text/accent
+    // is a deep brown. The coral fill survives where the gradient is drawn —
+    // a primary button, the SOS disc — and that gradient is shared between
+    // the themes.
+    accent: Color(0xFF8C4F38), // color/text/accent
+    accentInk: Color(0xFF8C4F38),
+    live: Color(0xFFB53C37), // color/text/danger
+    ok: Color(0xFF136C34), // color/text/success
+    warn: Color(0xFF8C6112), // color/text/warning
+    lineLight: Color(0x805C5752),
+    hover: Color(0x0F000000),
+    pressed: Color(0x1F000000),
+  );
+
+  @override
+  AppPalette copyWith() => this;
+
+  @override
+  AppPalette lerp(ThemeExtension<AppPalette>? other, double t) =>
+      t < 0.5 ? this : (other as AppPalette? ?? this);
+}
+
+/// The palette in force. Anything drawn outside a build — a painter, a static
+/// helper — takes one as an argument rather than reaching for this.
+extension PaletteContext on BuildContext {
+  AppPalette get pal =>
+      Theme.of(this).extension<AppPalette>() ?? AppPalette.dark;
+}
+
+class AppRadius {
+  AppRadius._();
+
+  static const double chip = 11;
+  static const double control = 12; // rows, fields, every button
+  static const double card = 14; // list cards, notices
+  static const double panel = 16; // grouped panels, selection cards
+  static const double sheet = 20; // bottom sheets, screen frame
+}
+
+/// The type ramp. Weights carry more meaning than sizes here: w900 uppercase
+/// names a thing, w300 is prose, and a 10px w700 uppercase "eyebrow" labels
+/// every section.
+class AppText {
+  AppText._();
+
+  static const TextStyle display = TextStyle(
+    fontSize: 32,
+    height: 34 / 32,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -1.3,
+    color: AppColors.onBackground,
+  );
+  static const TextStyle title = TextStyle(
+    fontSize: 24,
+    height: 26 / 24,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -0.9,
+    color: AppColors.onBackground,
+  );
+  static const TextStyle screenTitle = TextStyle(
+    fontSize: 15,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -0.4,
+    color: AppColors.onBackground,
+  );
+  static const TextStyle cardTitle = TextStyle(
+    fontSize: 14,
+    height: 1,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -0.4,
+    color: AppColors.onBackground,
+  );
+  static const TextStyle rowTitle = TextStyle(
+    fontSize: 12,
+    height: 1,
+    fontWeight: FontWeight.w800,
+    letterSpacing: -0.2,
+    color: AppColors.onBackground,
+  );
+  static const TextStyle body = TextStyle(
+    fontSize: 14,
+    height: 20 / 14,
+    fontWeight: FontWeight.w300,
+    color: AppColors.label,
+  );
+  static const TextStyle meta = TextStyle(
+    fontSize: 11,
+    height: 1,
+    fontWeight: FontWeight.w400,
+    color: AppColors.muted,
+  );
+  static const TextStyle eyebrow = TextStyle(
+    fontSize: 10,
+    fontWeight: FontWeight.w700,
+    letterSpacing: 1,
+    color: AppColors.faint,
+  );
+
+  /// Type/Label small — status badges and chips. 11 px is the floor for
+  /// anything a person reads (pass 4 retired the 9 px eyebrow small).
+  static const TextStyle tag = TextStyle(
+    fontSize: 11,
+    height: 14 / 11,
+    fontWeight: FontWeight.w700,
+    letterSpacing: 0.2,
+  );
+  static const TextStyle action = TextStyle(
+    fontSize: 12,
+    fontWeight: FontWeight.w900,
+    letterSpacing: 1.2,
+    color: AppColors.accentText,
+  );
+  static const TextStyle numeral = TextStyle(
+    fontSize: 26,
+    height: 1,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -1.2,
+    color: AppColors.onBackground,
+  );
+
+  // ── REPLIT-OVERHAUL additions ───────────────────────────────────────────
+  // The Figma's named text styles that the v2 ramp above did not have. Names
+  // follow the Figma ("Type/Heading 1" → heading1) so a spec reads straight
+  // across. The design sets everything in Inter; until the font is bundled
+  // these fall back to the platform face at the same size and weight.
+  static const TextStyle heading1 = TextStyle(
+    fontSize: 28,
+    height: 32 / 28,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -1.1,
+    color: AppColors.onBackground,
+  );
+  static const TextStyle heading2 = TextStyle(
+    fontSize: 26,
+    height: 28 / 26,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -1,
+    color: AppColors.onBackground,
+  );
+
+  /// "Type/Title" — 17px, the sheet and card-header size.
+  static const TextStyle headline = TextStyle(
+    fontSize: 17,
+    height: 20 / 17,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -0.5,
+    color: AppColors.onBackground,
+  );
+  static const TextStyle subtitle = TextStyle(
+    fontSize: 15,
+    height: 18 / 15,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -0.5,
+    color: AppColors.onBackground,
+  );
+  static const TextStyle cardTitleSm = TextStyle(
+    fontSize: 13,
+    height: 15 / 13,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -0.3,
+    color: AppColors.onBackground,
+  );
+
+  /// "Type/Row title" — the 13px list-row name ([rowTitle] is the 12px one).
+  static const TextStyle rowTitleLg = TextStyle(
+    fontSize: 13,
+    height: 16 / 13,
+    fontWeight: FontWeight.w800,
+    letterSpacing: -0.2,
+    color: AppColors.onBackground,
+  );
+
+  /// "Type/Row title large" — the 15px name on a list item or an Area card.
+  static const TextStyle listTitle = TextStyle(
+    fontSize: 15,
+    height: 20 / 15,
+    fontWeight: FontWeight.w800,
+    letterSpacing: -0.2,
+    color: AppColors.onBackground,
+  );
+
+  /// "Type/Instruction" — the next turn on the navigation banner, read in a
+  /// moving vehicle ("Turn right onto Taft Avenue").
+  static const TextStyle instruction = TextStyle(
+    fontSize: 24,
+    height: 30 / 24,
+    fontWeight: FontWeight.w800,
+    letterSpacing: -0.4,
+    color: AppColors.onBackground,
+  );
+
+  /// A bottom sheet's question — "Accept Area 1.2?", "Reject Area 2.1?".
+  static const TextStyle sheetTitle = TextStyle(
+    fontSize: 22,
+    height: 28 / 22,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -0.6,
+    color: AppColors.onBackground,
+  );
+
+  /// "Type/Button large" — the 56px run-screen action (Accept, Mark arrived,
+  /// Mark fire out), uppercase like every other button label.
+  static const TextStyle actionRun = TextStyle(
+    fontSize: 15,
+    height: 20 / 15,
+    fontWeight: FontWeight.w900,
+    letterSpacing: 1,
+    color: AppColors.accentText,
+  );
+  static const TextStyle rowValue = TextStyle(
+    fontSize: 13,
+    height: 16 / 13,
+    fontWeight: FontWeight.w600,
+    letterSpacing: -0.1,
+    color: AppColors.textSoft,
+  );
+  static const TextStyle bodySm = TextStyle(
+    fontSize: 13,
+    height: 18 / 13,
+    fontWeight: FontWeight.w400,
+    color: AppColors.label,
+  );
+
+  /// "Type/Meta" — 12px secondary line. ([meta] above is the 11px caption.)
+  static const TextStyle detail = TextStyle(
+    fontSize: 12,
+    height: 16 / 12,
+    fontWeight: FontWeight.w400,
+    color: AppColors.muted,
+  );
+  static const TextStyle caption = TextStyle(
+    fontSize: 11,
+    height: 14 / 11,
+    fontWeight: FontWeight.w400,
+    color: AppColors.muted,
+  );
+
+  /// Was 10 px; pass 4 retired Caption small for Caption (11 px).
+  static const TextStyle captionSm = TextStyle(
+    fontSize: 11,
+    height: 14 / 11,
+    fontWeight: FontWeight.w400,
+    color: AppColors.muted,
+  );
+  static const TextStyle label = TextStyle(
+    fontSize: 12,
+    height: 16 / 12,
+    fontWeight: FontWeight.w700,
+    letterSpacing: 0.2,
+    color: AppColors.onBackground,
+  );
+
+  static const TextStyle labelSm = TextStyle(
+    fontSize: 11,
+    height: 14 / 11,
+    fontWeight: FontWeight.w700,
+    letterSpacing: 0.2,
+    color: AppColors.textSoft,
+  );
+  static const TextStyle numeralSm = TextStyle(
+    fontSize: 17,
+    height: 1,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -0.5,
+    color: AppColors.onBackground,
+  );
+  static const TextStyle numeralXl = TextStyle(
+    fontSize: 34,
+    height: 1,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -1.6,
+    color: AppColors.onBackground,
+  );
+  static const TextStyle dial = TextStyle(
+    fontSize: 22,
+    height: 1,
+    fontWeight: FontWeight.w900,
+    letterSpacing: 1.5,
+    color: AppColors.onBackground,
+  );
+
+  /// Type/Onboarding heading — the one line that names each tour step.
+  static const TextStyle tourHeading = TextStyle(
+    fontSize: 26,
+    height: 31 / 26,
+    fontWeight: FontWeight.w900,
+    letterSpacing: -0.7,
+    color: AppColors.onBackground,
+  );
+
+  /// Type/Body large — tour prose, a size up from the rest of the app.
+  static const TextStyle bodyLarge = TextStyle(
+    fontSize: 16,
+    height: 24 / 16,
+    fontWeight: FontWeight.w300,
+    color: AppColors.textSoft,
+  );
+
+  /// Type/Button large — the tour's full-width call to action.
+  static const TextStyle actionLarge = TextStyle(
+    fontSize: 16,
+    height: 20 / 16,
+    fontWeight: FontWeight.w900,
+    letterSpacing: 0.4,
+    color: AppColors.accentText,
+  );
+
+  /// Type/Input — 16 px, so a phone keyboard does not zoom the field.
+  static const TextStyle input = TextStyle(
+    fontSize: 16,
+    height: 22 / 16,
+    fontWeight: FontWeight.w500,
+    color: AppColors.onBackground,
+  );
+}
+
+/// Light status-bar glyphs on the dark ground.
+/// The type ramp in the palette's ink.
+///
+/// Same metrics as [AppText] — only the colour moves between themes, so a
+/// screen reads `context.type.cardTitle` and gets the right one either way.
+/// [AppText] itself keeps the dark values, for the screens not yet moved over
+/// and for anything that needs a const style.
+@immutable
+class AppType {
+  const AppType(this._p);
+
+  final AppPalette _p;
+
+  TextStyle get display => AppText.display.copyWith(color: _p.onBackground);
+  TextStyle get title => AppText.title.copyWith(color: _p.onBackground);
+  TextStyle get screenTitle =>
+      AppText.screenTitle.copyWith(color: _p.onBackground);
+  TextStyle get cardTitle => AppText.cardTitle.copyWith(color: _p.onBackground);
+  TextStyle get rowTitle => AppText.rowTitle.copyWith(color: _p.onBackground);
+  TextStyle get body => AppText.body.copyWith(color: _p.label);
+  TextStyle get meta => AppText.meta.copyWith(color: _p.muted);
+  TextStyle get eyebrow => AppText.eyebrow.copyWith(color: _p.faint);
+  TextStyle get tag => AppText.tag;
+  TextStyle get action => AppText.action.copyWith(color: _p.accentText);
+  TextStyle get numeral => AppText.numeral.copyWith(color: _p.onBackground);
+  TextStyle get heading1 => AppText.heading1.copyWith(color: _p.onBackground);
+  TextStyle get heading2 => AppText.heading2.copyWith(color: _p.onBackground);
+  TextStyle get headline => AppText.headline.copyWith(color: _p.onBackground);
+  TextStyle get subtitle => AppText.subtitle.copyWith(color: _p.onBackground);
+  TextStyle get cardTitleSm =>
+      AppText.cardTitleSm.copyWith(color: _p.onBackground);
+  TextStyle get rowTitleLg =>
+      AppText.rowTitleLg.copyWith(color: _p.onBackground);
+  TextStyle get listTitle => AppText.listTitle.copyWith(color: _p.onBackground);
+  TextStyle get instruction =>
+      AppText.instruction.copyWith(color: _p.onBackground);
+  TextStyle get sheetTitle =>
+      AppText.sheetTitle.copyWith(color: _p.onBackground);
+  TextStyle get actionRun => AppText.actionRun.copyWith(color: _p.accentText);
+  TextStyle get rowValue => AppText.rowValue.copyWith(color: _p.textSoft);
+  TextStyle get bodySm => AppText.bodySm.copyWith(color: _p.label);
+  TextStyle get detail => AppText.detail.copyWith(color: _p.muted);
+  TextStyle get caption => AppText.caption.copyWith(color: _p.muted);
+  TextStyle get captionSm => AppText.captionSm.copyWith(color: _p.muted);
+  TextStyle get label => AppText.label.copyWith(color: _p.onBackground);
+  TextStyle get labelSm => AppText.labelSm.copyWith(color: _p.textSoft);
+  TextStyle get numeralSm => AppText.numeralSm.copyWith(color: _p.onBackground);
+  TextStyle get numeralXl => AppText.numeralXl.copyWith(color: _p.onBackground);
+  TextStyle get dial => AppText.dial.copyWith(color: _p.onBackground);
+  TextStyle get tourHeading =>
+      AppText.tourHeading.copyWith(color: _p.onBackground);
+  TextStyle get bodyLarge => AppText.bodyLarge.copyWith(color: _p.textSoft);
+  TextStyle get actionLarge =>
+      AppText.actionLarge.copyWith(color: _p.accentText);
+  TextStyle get input => AppText.input.copyWith(color: _p.onBackground);
+}
+
+/// The type ramp in force, alongside [PaletteContext.pal].
+extension TypeContext on BuildContext {
+  AppType get type => AppType(pal);
+}
+
+/// Light status-bar glyphs on the dark ground; dark ones on the light.
+SystemUiOverlayStyle overlayFor(AppPalette pal) => SystemUiOverlayStyle(
+  statusBarColor: Colors.transparent,
+  statusBarIconBrightness: pal.isLight ? Brightness.dark : Brightness.light,
+  statusBarBrightness: pal.brightness,
+  systemNavigationBarColor: pal.surfaceSolid,
+  systemNavigationBarIconBrightness: pal.isLight
+      ? Brightness.dark
+      : Brightness.light,
+);
+
+ThemeData buildAppTheme([AppPalette pal = AppPalette.dark]) {
+  final base = pal.isLight
+      ? ThemeData.light(useMaterial3: true)
+      : ThemeData.dark(useMaterial3: true);
+
+  // The Text field component (04, pass 4): a 54 px field on the inset surface
+  // with a 3 : 1 control edge at rest, a 2 px coral edge in focus and a red
+  // edge in error. The hairline is for cards, never for a control.
+  OutlineInputBorder fieldBorder(Color color, [double width = 1]) =>
+      OutlineInputBorder(
+        borderRadius: BorderRadius.circular(AppRadius.control),
+        borderSide: BorderSide(color: color, width: width),
+      );
+
+  final type = AppType(pal);
+  return base.copyWith(
+    extensions: <ThemeExtension<dynamic>>[pal],
+    scaffoldBackgroundColor: pal.background,
+    canvasColor: pal.background,
+    colorScheme: base.colorScheme.copyWith(
+      surface: pal.background,
+      primary: pal.accent,
+      onPrimary: AppColors.accentText,
+      secondary: AppColors.gradientEnd,
+      error: pal.live,
+    ),
+    textTheme: base.textTheme.apply(
+      bodyColor: pal.onBackground,
+      displayColor: pal.onBackground,
+    ),
+    appBarTheme: AppBarTheme(
+      backgroundColor: Colors.transparent,
+      surfaceTintColor: Colors.transparent,
+      elevation: 0,
+      centerTitle: false,
+      systemOverlayStyle: overlayFor(pal),
+      titleTextStyle: type.screenTitle,
+      iconTheme: IconThemeData(color: pal.onBackground, size: 20),
+    ),
+    dividerTheme: DividerThemeData(color: pal.line, thickness: 1, space: 1),
+    inputDecorationTheme: InputDecorationTheme(
+      filled: true,
+      fillColor: pal.inputBg,
+      hintStyle: TextStyle(
+        fontSize: 16,
+        fontWeight: FontWeight.w500,
+        color: pal.placeholder,
+      ),
+      labelStyle: type.eyebrow,
+      floatingLabelStyle: type.eyebrow.copyWith(color: pal.accentInk),
+      contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+      border: fieldBorder(pal.lineStrong),
+      enabledBorder: fieldBorder(pal.lineStrong),
+      disabledBorder: fieldBorder(pal.line),
+      focusedBorder: fieldBorder(pal.accent, 2),
+      errorBorder: fieldBorder(pal.live, 1.5),
+      focusedErrorBorder: fieldBorder(pal.live, 1.5),
+      errorStyle: TextStyle(
+        fontSize: 11,
+        fontWeight: FontWeight.w600,
+        color: pal.live,
+      ),
+    ),
+    snackBarTheme: SnackBarThemeData(
+      behavior: SnackBarBehavior.floating,
+      backgroundColor: pal.raised,
+      contentTextStyle: TextStyle(
+        fontSize: 12.5,
+        fontWeight: FontWeight.w600,
+        color: pal.onBackground,
+      ),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(AppRadius.control),
+      ),
+    ),
+    dialogTheme: DialogThemeData(
+      backgroundColor: pal.surfaceSolid,
+      surfaceTintColor: Colors.transparent,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(AppRadius.panel),
+      ),
+    ),
+    bottomSheetTheme: BottomSheetThemeData(
+      backgroundColor: pal.surfaceSolid,
+      surfaceTintColor: Colors.transparent,
+    ),
+    progressIndicatorTheme: ProgressIndicatorThemeData(
+      color: pal.accentInk,
+      linearTrackColor: pal.line,
+      circularTrackColor: pal.line,
+    ),
+    switchTheme: SwitchThemeData(
+      thumbColor: WidgetStateProperty.resolveWith(
+        (s) => s.contains(WidgetState.selected) ? pal.surfaceSolid : pal.label,
+      ),
+      trackColor: WidgetStateProperty.resolveWith(
+        (s) => s.contains(WidgetState.selected) ? pal.accent : pal.glass,
+      ),
+      // Off, the track needs the 3 : 1 control edge to be seen at all.
+      trackOutlineColor: WidgetStateProperty.resolveWith(
+        (s) => s.contains(WidgetState.selected)
+            ? Colors.transparent
+            : pal.lineStrong,
+      ),
+    ),
+    textSelectionTheme: TextSelectionThemeData(
+      cursorColor: pal.accentInk,
+      selectionColor: Color(0x40FF9066),
+      selectionHandleColor: pal.accentInk,
+    ),
+    cardTheme: CardThemeData(
+      color: pal.glass,
+      elevation: 0,
+      margin: EdgeInsets.zero,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(AppRadius.panel),
+      ),
+    ),
+    elevatedButtonTheme: ElevatedButtonThemeData(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: pal.accent,
+        foregroundColor: AppColors.accentText,
+        minimumSize: Size(double.infinity, 52),
+        elevation: 0,
+        textStyle: type.action,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadius.control),
+        ),
+      ),
+    ),
+    filledButtonTheme: FilledButtonThemeData(
+      style: FilledButton.styleFrom(
+        backgroundColor: pal.accent,
+        foregroundColor: AppColors.accentText,
+        minimumSize: Size(double.infinity, 52),
+        textStyle: type.action,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadius.control),
+        ),
+      ),
+    ),
+    outlinedButtonTheme: OutlinedButtonThemeData(
+      style: OutlinedButton.styleFrom(
+        foregroundColor: pal.textSoft,
+        backgroundColor: pal.glass,
+        minimumSize: Size(0, 48),
+        side: BorderSide(color: pal.lineStrong),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(AppRadius.control),
+        ),
+      ),
+    ),
+    textButtonTheme: TextButtonThemeData(
+      style: TextButton.styleFrom(foregroundColor: pal.accentInk),
+    ),
+  );
+}
