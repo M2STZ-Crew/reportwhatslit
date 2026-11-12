@@ -21,6 +21,18 @@ Environment = Literal["development", "staging", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 
 
+# The Admin console's addresses, allowed whatever CORS_ORIGINS says, so its
+# domain change (12 Nov 2026: "admin domain change") needs no edit on Render.
+# It is served at reportwhatslit.vercel.app; reportwhatslit-admin and the old
+# replit-backend-5u9u address redirect there, and stay allowed in case either
+# is made the one it is served at.
+CONSOLE_ORIGINS = (
+    "https://reportwhatslit.vercel.app",
+    "https://reportwhatslit-admin.vercel.app",
+    "https://replit-backend-5u9u.vercel.app",
+)
+
+
 class Settings(BaseSettings):
     """Strongly-typed application settings loaded from the environment / ``.env``."""
 
@@ -37,7 +49,7 @@ class Settings(BaseSettings):
         description='Deployment environment: "development" | "staging" | "production".',
     )
     app_name: str = Field(default="RepLiT Backend", description="Human-readable app name.")
-    app_version: str = Field(default="1.12.25", description="Semantic version of the build.")
+    app_version: str = Field(default="1.12.29", description="Semantic version of the build.")
     host: str = Field(default="0.0.0.0", description="Uvicorn bind host.")
     port: int = Field(default=8000, ge=1, le=65535, description="Uvicorn bind port.")
 
@@ -146,6 +158,13 @@ class Settings(BaseSettings):
         default="",
         description="The public address to ask; empty uses RENDER_EXTERNAL_URL.",
     )
+    # "New Update!" (app/workers/app_updates.py, v1.12.29): every this many
+    # minutes the service reads the app's newest release and tells anyone on
+    # an older version, once per version. 0 turns it off.
+    app_update_check_minutes: int = Field(
+        default=10, ge=0, le=1440,
+        description="Minutes between checks for a new app release; 0 is off.",
+    )
 
     # ----- Didit.me KYC (Phase 4) -----
     didit_api_key: str = Field(default="", description="Didit.me API key (x-api-key).")
@@ -194,7 +213,7 @@ class Settings(BaseSettings):
     neighborhood_location_max_age_minutes: int = Field(
         default=30, ge=1, description=
         "How old a user's last-known location may be and still put them inside "
-        "a fire's 150 m neighbourhood alert. Older ones are where they were, not "
+        "a fire's 100 m neighbourhood alert. Older ones are where they were, not "
         "where they are."
     )
 
@@ -267,8 +286,10 @@ class Settings(BaseSettings):
     # ----- Derived helpers -----
     @property
     def cors_origins_list(self) -> list[str]:
-        """Return the parsed CORS origins, with blank entries stripped."""
-        return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+        """Return the parsed CORS origins, with blank entries stripped, and
+        the Admin console's own addresses (CONSOLE_ORIGINS) always among them."""
+        origins = [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+        return origins + [o for o in CONSOLE_ORIGINS if o not in origins]
 
     @property
     def is_development(self) -> bool:

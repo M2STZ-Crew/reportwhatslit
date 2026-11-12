@@ -50,6 +50,7 @@ from app.schemas.common import MessageResponse
 from app.schemas.incident import (
     AvailableResponder,
     DispatchItem,
+    FireTypeRequest,
     IncidentDetail,
     IncidentRejectRequest,
     IncidentReportDetail,
@@ -61,6 +62,11 @@ from app.schemas.incident import (
 )
 from app.services.access import ACKNOWLEDGE, acting_agency, admin_access
 from app.services.audit import record_audit
+from app.services.fire_type import (
+    ON_SCENE_STATUSES,
+    assert_may_answer,
+    validate_fire_type,
+)
 from app.services.incident import (
     OFF_FEED_STATUSES,
     active_area_sql,
@@ -78,6 +84,7 @@ from app.services.incident_notify import (
     notify_incident_reporters,
 )
 from app.services.map_feed import publish_area_change
+from app.services.pir_queue import pir_progress
 from app.services.tracking import gps_arrival_distance, publish_tracking
 from app.services.verifier import fetch_verifier
 from app.workers.coordinator_pings import stop_pings
@@ -126,7 +133,12 @@ _SUMMARY_COLS = """
               from public.area_acceptances aa
               where aa.area_id = a.id and aa.organization_id is not null), '{}')
         as accepted_organization_ids,
-    (select count(*) from public.area_routes rt where rt.area_id = a.id) as route_count
+    (select count(*) from public.area_routes rt where rt.area_id = a.id) as route_count,
+    -- Read through to_jsonb so a deploy that lands before migration
+    -- 20261112090000 still lists incidents: the fields read as null.
+    to_jsonb(a) ->> 'fire_type' as fire_type,
+    to_jsonb(a) ->> 'fire_subtype' as fire_subtype,
+    (to_jsonb(a) ->> 'fire_type_set_at')::timestamptz as fire_type_set_at
 """
 
 
@@ -268,6 +280,16 @@ async def build_incident_detail(db: Database, incident_id: UUID) -> IncidentDeta
                a.rejection_reason,
                a.merged_by, mu.full_name as merged_by_name, a.merged_into_area_id,
                a.alarm_level_set_by, a.alarm_level_set_at,
+               (select fu.full_name from public.users fu
+                 where fu.id = (to_jsonb(a) ->> 'fire_type_set_by')::uuid)
+                 as fire_type_set_by_name,
+               (select fu.primary_org_id from public.users fu
+                 where fu.id = (to_jsonb(a) ->> 'fire_type_set_by')::uuid)
+                 as fire_type_org_id,
+               (select fo.name from public.users fu
+                  join public.organizations fo on fo.id = fu.primary_org_id
+                 where fu.id = (to_jsonb(a) ->> 'fire_type_set_by')::uuid)
+                 as fire_type_org_name,
                exists (select 1 from public.post_incident_reports p
                        where p.area_id = a.id) as has_post_incident_report
         from public.areas a
@@ -323,7 +345,11 @@ async def build_incident_detail(db: Database, incident_id: UUID) -> IncidentDeta
         incident_id,
     )
     verifier = await fetch_verifier(db, incident_id)
+    progress = await pir_progress(db, incident_id)
     data = dict(row)
+    data["pir_teams_expected"] = len(progress.expected)
+    data["pir_teams_filed"] = len(progress.filed)
+    data["pir_waiting_on"] = list(progress.waiting_names)
     data["routes"] = [dict(r) for r in routes]
     data["acceptances"] = [dict(r) for r in acceptances]
     data["reports"] = [dict(r) for r in reports]
@@ -1039,6 +1065,99 @@ async def mark_arrived(
     return await finish_incident_change(db, incident_id, "incident_arrived")
 
 
+@router.post(
+    "/{incident_id}/fire-type",
+    response_model=IncidentDetail,
+    summary="Say what is burning (on scene)",
+)
+async def set_fire_type(
+    incident_id: UUID,
+    payload: FireTypeRequest,
+    request: Request,
+    user: StaffUser,
+    db: DatabaseDep,
+) -> IncidentDetail:
+    """Record what is burning, and its subtype where it has them (PRD v14 §4.5.3).
+
+    "What's burning?" is asked once the unit is on scene, before the on-scene
+    requests unlock (Figma C18 / R08b); a later answer corrects it, up to the
+    Post-Incident Report. A fire team's Coordinator, or a Responder of it
+    going to it, may set it — the first fire team to answer; after that only
+    that team corrects it (v1.12.29: 403 ``fire_team_only``, 409
+    ``fire_type_answered``). Before arrival it is a 409 ``not_on_scene``; a
+    subtype that is not the type's own is a 400.
+    """
+    subtype = validate_fire_type(payload.fire_type, payload.fire_subtype)
+    await _load_status(db, incident_id)
+    await _assert_visible(db, incident_id, user)
+    await _assert_responder_or_coordinator(db, incident_id, user)
+    assert_may_answer(
+        agency=user.agency_type,
+        org_id=user.primary_org_id,
+        answered_by_org=None,
+        answered_by_name=None,
+    )
+    async with db.acquire() as conn, conn.transaction():
+        current = await _lock_status(conn, incident_id)
+        if current not in ON_SCENE_STATUSES:
+            raise ConflictError(
+                "Say what is burning once you are on scene.",
+                error_code="not_on_scene",
+                details={"status": current},
+            )
+        before = await conn.fetchrow(
+            "select fire_type, fire_subtype from public.areas where id = $1", incident_id
+        )
+        answered = await conn.fetchrow(
+            """
+            select u.primary_org_id as org_id, o.name as org_name
+              from public.areas a
+              join public.users u on u.id = a.fire_type_set_by
+              left join public.organizations o on o.id = u.primary_org_id
+             where a.id = $1 and a.fire_type is not null
+            """,
+            incident_id,
+        )
+        if answered is not None:
+            assert_may_answer(
+                agency=user.agency_type,
+                org_id=user.primary_org_id,
+                answered_by_org=answered["org_id"],
+                answered_by_name=answered["org_name"],
+            )
+        await conn.execute(
+            """
+            update public.areas
+               set fire_type = $2, fire_subtype = $3,
+                   fire_type_set_by = $4, fire_type_set_at = now()
+             where id = $1
+            """,
+            incident_id,
+            payload.fire_type,
+            subtype,
+            user.id,
+        )
+        await record_audit(
+            conn,
+            request,
+            user,
+            action="incident.fire_type",
+            entity_type="area",
+            entity_id=incident_id,
+            area_id=incident_id,
+            before_state=dict(before) if before is not None else None,
+            after_state={"fire_type": payload.fire_type, "fire_subtype": subtype},
+        )
+    log.info(
+        "incident_fire_type",
+        incident_id=str(incident_id),
+        user_id=str(user.id),
+        fire_type=payload.fire_type,
+        fire_subtype=subtype,
+    )
+    return await finish_incident_change(db, incident_id, "incident_fire_type")
+
+
 async def arrive_by_gps(
     db: Database, request: Request | None, user: AuthenticatedUser, incident_id: UUID
 ) -> bool:
@@ -1157,13 +1276,16 @@ async def list_responder_locations(
 ) -> list[ResponderLocationItem]:
     """Return the most recent GPS fix for each responder on the incident (live map).
 
-    An organisation's Admin sees its own units only (pass 6 A00, A30).
+    An organisation's Admin sees its own units only (pass 6 A00, A30); the
+    system Admin and the central hub see every unit.
     """
     await _load_status(db, incident_id)
     await _assert_visible(db, incident_id, user)
     access = admin_access(user)
-    own_org = access.organization_id if access is not None and not access.is_system else None
-    if access is not None and not access.is_system and own_org is None:
+    own_org = (
+        access.organization_id if access is not None and not access.governs_all else None
+    )
+    if access is not None and not access.governs_all and own_org is None:
         return []
     rows = await db.fetch(
         """
