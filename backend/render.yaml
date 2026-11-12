@@ -1,0 +1,100 @@
+# Render blueprint — free-tier deployment of the RepLiT backend.
+#
+# Usage: push this file, then in Render choose New > Blueprint and point it at
+# this repository (branch: main). Render reads this file, builds the Dockerfile
+# at the repo root, and creates the service.
+#
+# The branch was `safe-commits` until main became the real trunk. A service
+# still pointed at the old branch keeps building stale code silently, so check
+# Settings > Branch in the Render dashboard if a push to main does not deploy.
+#
+# Secrets are deliberately NOT in here. Every value marked `sync: false` must be
+# pasted into the Render dashboard once — committing them would put the
+# service-role key in git history.
+#
+# Free-tier limits worth knowing:
+#   - a free instance sleeps after ~15 minutes with no traffic from outside, and
+#     wakes on the next request (~50 s). On 7 and 8 November it stopped waking:
+#     requests hung, and only a manual deploy brought it back. Since v1.12.24 it
+#     never sleeps: every KEEP_AWAKE_MINUTES (10) it asks for its own /health at
+#     RENDER_EXTERNAL_URL (app/workers/keep_awake.py), which also keeps the 60 s
+#     neighbourhood alerts running all night. A month awake is 720-744 of the
+#     workspace's 750 free instance hours, with this the only service using them.
+#   - .github/workflows/keep-awake.yml checks /health every 10 minutes from
+#     GitHub and, if it does not answer, deploys again through the deploy hook in
+#     the repository secret RENDER_DEPLOY_HOOK_URL (Settings > Deploy Hook).
+#   - 512 MB RAM, no persistent disk. Hence FCM_CREDENTIALS_JSON rather than
+#     FCM_CREDENTIALS_FILE: there is nowhere to put the service-account file.
+
+services:
+  - type: web
+    name: replit-backend
+    runtime: docker
+    plan: free
+    region: singapore # closest Render region to Pasay City
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_JSON
+        value: "true"
+      - key: LOG_LEVEL
+        value: INFO
+
+      # Comma-separated origins of the deployed dashboard. Update once the
+      # frontend has its URL, or the browser blocks every request.
+      - key: CORS_ORIGINS
+        sync: false
+
+      # Must be this service's own public URL. Used to build the email
+      # verification links and the Didit KYC callback, so a wrong value sends
+      # users to localhost.
+      - key: PUBLIC_BASE_URL
+        sync: false
+
+      # ---- Supabase (required) ----
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false
+      - key: SUPABASE_PROJECT_REF
+        sync: false
+      # Use the TRANSACTION pooler URI (port 6543) — a free instance holds few
+      # connections and the pooler is what keeps that workable.
+      - key: DATABASE_URL
+        sync: false
+
+      # ---- Optional integrations. Each feature degrades cleanly if unset, so a
+      # demo can go live before every provider is configured. ----
+      # Phone verification codes (+40%, and the citizen gate). Semaphore only
+      # delivers to Philippine numbers; set the sender name once Semaphore has
+      # approved one, otherwise the account's default sender is used.
+      - key: SEMAPHORE_API_KEY
+        sync: false
+      - key: SEMAPHORE_SENDER_NAME
+        sync: false
+      - key: BREVO_SMTP_USER
+        sync: false
+      - key: BREVO_SMTP_KEY
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: DIDIT_API_KEY
+        sync: false
+      - key: DIDIT_WORKFLOW_ID
+        sync: false
+      - key: DIDIT_WEBHOOK_SECRET
+        sync: false
+      # The whole service-account JSON on one line — there is no writable disk.
+      - key: FCM_CREDENTIALS_JSON
+        sync: false
+      # DeepSeek API key for the post-incident AI summary.
+      - key: deepseek_summarization
+        sync: false

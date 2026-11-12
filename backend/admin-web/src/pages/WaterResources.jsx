@@ -1,0 +1,350 @@
+import 'leaflet/dist/leaflet.css';
+
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { MapContainer, Marker, ZoomControl } from 'react-leaflet';
+
+import { api } from '../api/client.js';
+import { useConsole } from '../components/ConsoleShell.jsx';
+import { markerIcon } from '../components/map/markers.js';
+import Place from '../components/Place.jsx';
+import Icon from '../components/ui/Icon.jsx';
+import { ConfirmDialog, EmptyState, PageHeader, StatePanel, StatusChip } from '../components/ui/index.js';
+import { PERM, can } from '../lib/access.js';
+import { degrees, knownAddress } from '../lib/place.js';
+import BaseTiles from '../map/BaseTiles.jsx';
+import { t } from '../i18n/i18n.jsx';
+
+/* Water resources (REPLIT (MAIN) 10 · A32 871:4044 list, A33 871:4382 map
+ * and detail, A34 delete, A34b deleted; PRD v13 §4.9.6): every hydrant,
+ * body of water and underground cistern, as a list or on the map, with its
+ * detail and Delete — any Admin may delete a water resource.
+ *
+ * The server knows each source's status, not a level. The 5 % water level,
+ * its history and "last checked by" an organisation arrive with the
+ * water_resources table (PRD v13 §6.1, §17.3), so this page shows the status
+ * it has and estimates nothing. Adding and updating a source (A35) happen in
+ * Map settings, which this page opens for the Admin who may (`map.manage`). */
+
+const KINDS = [
+  { key: 'hydrant', get label() { return t('Hydrants'); }, get singular() { return t('Hydrant'); }, path: 'hydrants' },
+  { key: 'water', get label() { return t('Bodies of water'); }, get singular() { return t('Body of water'); }, path: 'bodies-of-water' },
+  { key: 'cistern', get label() { return t('Cisterns'); }, get singular() { return t('Cistern'); }, path: 'underground-cisterns' },
+];
+const kindOf = (key) => KINDS.find((k) => k.key === key);
+
+const STATUS = {
+  operational: { get label() { return t('Operational'); }, tone: 'ok' },
+  non_operational: { get label() { return t('Not usable'); }, tone: 'danger' },
+  under_maintenance: { get label() { return t('Under maintenance'); }, tone: 'warn' },
+  unknown: { get label() { return t('Not checked'); }, tone: 'neutral' },
+};
+
+function statusOf(row) {
+  if (row.kind === 'water') {
+    return row.is_accessible ? { label: t('Accessible'), tone: 'ok' } : { label: t('Not accessible'), tone: 'danger' };
+  }
+  const value = row.kind === 'hydrant' ? row.effective_status : row.status;
+  return STATUS[value] ?? STATUS.unknown;
+}
+
+function nameOf(row) {
+  const singular = kindOf(row.kind).singular;
+  const label = row.kind === 'hydrant' ? row.code : row.name || row.code;
+  return label ? `${label} · ${singular}` : singular;
+}
+
+// For search: the record's own address, else the street looked up for it
+// (once known), else the degrees.
+const placeOf = (row) => row.address
+  || knownAddress(row.latitude, row.longitude)
+  || degrees(row.latitude, row.longitude);
+
+const WHEN = new Intl.DateTimeFormat('en-PH', {
+  timeZone: 'Asia/Manila', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+});
+const when = (iso) => {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? null : WHEN.format(d);
+};
+
+/* When the source was last looked at: a hydrant's on-the-ground check, else
+ * the record's last change. */
+function checkedOf(row) {
+  if (row.kind === 'hydrant' && row.ground_truth_at) {
+    return { title: t('Checked on the ground'), at: when(row.ground_truth_at) };
+  }
+  return { title: t('Record updated'), at: when(row.updated_at) };
+}
+
+const PAGE = 10;
+
+function Detail({ row, onClose, onDelete, floating = false }) {
+  const status = statusOf(row);
+  const checked = checkedOf(row);
+  const facts = [
+    [t('Status'), <StatusChip key="s" label={status.label} tone={status.tone} />],
+    [checked.title, checked.at ?? '—'],
+    [t('Location'), <Place lat={row.latitude} lng={row.longitude} address={row.address} stacked />],
+  ];
+  if (row.kind === 'hydrant') {
+    facts.push([t('BFP status'), STATUS[row.bfp_status]?.label ?? '—']);
+    if (row.ground_truth_notes) facts.push([t('Field note'), row.ground_truth_notes]);
+  }
+  if (row.kind === 'cistern' && row.capacity_liters != null) {
+    facts.push([t('Capacity'), t('{amount} litres', { amount: row.capacity_liters.toLocaleString('en-PH') })]);
+  }
+  if (row.kind === 'water' && row.water_type) facts.push([t('Type'), row.water_type]);
+  if (row.description) facts.push([t('Description'), row.description]);
+
+  return (
+    <aside className={floating ? 'rpl-map-panel rpl-water-panel' : 'rpl-detail'} aria-labelledby="rpl-water-detail-title">
+      <div className="rpl-detail-head">
+        <div>
+          <p className="rpl-eyebrow">{kindOf(row.kind).singular}{row.code ? ` · ${row.code}` : ''}</p>
+          <h2 className="rpl-detail-title" id="rpl-water-detail-title">{row.name || row.address || nameOf(row)}</h2>
+        </div>
+        <button type="button" className="rpl-icon-button" onClick={onClose} aria-label={t('Close details')}>
+          <span aria-hidden="true">✕</span>
+        </button>
+      </div>
+      <dl className="rpl-facts">
+        {facts.map(([term, value]) => (
+          <div className="rpl-fact" key={term}>
+            <dt>{term}</dt>
+            <dd>{value}</dd>
+          </div>
+        ))}
+      </dl>
+      <button type="button" className="rpl-button rpl-button--danger" onClick={onDelete}>{t('Delete resource')}</button>
+    </aside>
+  );
+}
+
+export default function WaterResources({ onManage }) {
+  const { console: access } = useConsole();
+  const managesMap = can(access, PERM.MANAGE_MAP);
+  const [view, setView] = useState('list');
+  const [type, setType] = useState('all');
+  const [state, setState] = useState({ loading: true, error: null, rows: [] });
+  const [attempt, setAttempt] = useState(0);
+  const [query, setQuery] = useState('');
+  const [page, setPage] = useState(0);
+  const [selectedId, setSelectedId] = useState(null);
+  const [deleting, setDeleting] = useState(null);
+  const [notice, setNotice] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    setState((s) => ({ ...s, loading: true, error: null }));
+    Promise.all(KINDS.map((k) => api.mapLayer(k.path)))
+      .then((results) => {
+        if (!alive) return;
+        const rows = KINDS.flatMap((k, i) => (Array.isArray(results[i]) ? results[i] : []).map((r) => ({ ...r, kind: k.key })));
+        setState({ loading: false, error: null, rows });
+      })
+      .catch((e) => {
+        if (alive) setState({ loading: false, error: e.message || t('The water resources could not be loaded.'), rows: [] });
+      });
+    return () => { alive = false; };
+  }, [attempt]);
+
+  useEffect(() => {
+    if (!notice) return undefined;
+    const t = setTimeout(() => setNotice(null), 6000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
+  const term = query.trim().toLowerCase();
+  const rows = useMemo(
+    () => state.rows.filter((r) => (type === 'all' || r.kind === type)
+      && (!term || `${nameOf(r)} ${placeOf(r)}`.toLowerCase().includes(term))),
+    [state.rows, type, term],
+  );
+  useEffect(() => { setPage(0); }, [type, term]);
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+  const shown = rows.slice(page * PAGE, page * PAGE + PAGE);
+  const selected = state.rows.find((r) => `${r.kind}:${r.id}` === selectedId) ?? null;
+
+  const confirmDelete = useCallback(async () => {
+    const target = deleting;
+    await api.mapLayerDelete(kindOf(target.kind).path, target.id);
+    setState((s) => ({ ...s, rows: s.rows.filter((r) => !(r.kind === target.kind && r.id === target.id)) }));
+    setSelectedId(null);
+    setDeleting(null);
+    setNotice(t('{nameOf} deleted. It is gone from every map; the deletion is in the audit log.', { nameOf: nameOf(target) }));
+  }, [deleting]);
+
+  const filters = (
+    <div className="rpl-filters">
+      <label className="rpl-search">
+        <Icon name="search" />
+        <span className="web-sr-only">{t('Search water resources')}</span>
+        <input type="search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder={t('Search codes, names and streets')} />
+      </label>
+      <label className="rpl-select">
+        <span className="rpl-select-label">{t('Type')}</span>
+        <select value={type} onChange={(e) => setType(e.target.value)}>
+          <option value="all">{t('All types')}</option>
+          {KINDS.map((k) => <option key={k.key} value={k.key}>{k.label}</option>)}
+        </select>
+      </label>
+    </div>
+  );
+
+  return (
+    <div className={`rpl-page${view === 'map' ? ' rpl-page--map' : ''}`}>
+      <PageHeader
+        eyebrow={t('Shared across every organization')}
+        title={t('Water resources')}
+        description={managesMap
+          ? t('Every hydrant, body of water and underground cistern on the shared map. Any Admin may delete one; every deletion is recorded.')
+          : t('Every hydrant, body of water and underground cistern on the shared map. Any Admin may delete one; every deletion is recorded. Fire Volunteer, BFP and central hub Admins add and change them.')}
+        actions={managesMap && (
+          <button type="button" className="rpl-button rpl-button--primary" onClick={onManage}>{t('Add or change resources')}</button>
+        )}
+      />
+
+      {notice && (
+        <div className="rpl-toast" role="status"><span aria-hidden="true">✓</span>{notice}</div>
+      )}
+
+      <div className="rpl-tabs rpl-tabs--page" role="tablist" aria-label={t('View')}>
+        {[{ key: 'list', label: t('List') }, { key: 'map', label: t('Map') }].map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            role="tab"
+            aria-selected={view === t.key}
+            className={`rpl-tab${view === t.key ? ' is-active' : ''}`}
+            onClick={() => setView(t.key)}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {filters}
+
+      {state.loading ? (
+        <StatePanel kind="loading" title={t('Loading water resources…')} />
+      ) : state.error ? (
+        <StatePanel kind="error" title={t('The water resources couldn’t load')} description={state.error} onRetry={() => setAttempt((n) => n + 1)} />
+      ) : state.rows.length === 0 ? (
+        <EmptyState icon="water" title={t('No water resources yet')}>{t('Fire Volunteer Coordinators add hydrants, bodies of water and cisterns from the mobile app.')}</EmptyState>
+      ) : view === 'map' ? (
+        <div className="rpl-water-map">
+          <MapContainer
+            center={[14.5378, 121.0014]}
+            zoom={15}
+            zoomControl={false}
+            attributionControl={false}
+            style={{ height: '100%', width: '100%' }}
+          >
+            <BaseTiles />
+            <ZoomControl position="bottomright" />
+            {rows.filter((r) => r.latitude != null && r.longitude != null).map((r) => (
+              <Marker
+                key={`${r.kind}:${r.id}`}
+                position={[r.latitude, r.longitude]}
+                icon={markerIcon(r.kind, `${r.kind}:${r.id}` === selectedId)}
+                eventHandlers={{ click: () => setSelectedId(`${r.kind}:${r.id}`) }}
+                title={nameOf(r)}
+              />
+            ))}
+          </MapContainer>
+          {selected && (
+            <Detail row={selected} floating onClose={() => setSelectedId(null)} onDelete={() => setDeleting(selected)} />
+          )}
+        </div>
+      ) : (
+        <div className={`rpl-split${selected ? ' has-detail' : ''}`}>
+          <div className="rpl-stack">
+            <div className="web-table-wrap">
+              <table className="web-table">
+                <caption className="web-sr-only">{t('Water resources')}</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">{t('Resource')}</th>
+                    <th scope="col">{t('Status')}</th>
+                    <th scope="col">{t('Last checked')}</th>
+                    <th scope="col"><span className="web-sr-only">{t('Open')}</span></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {shown.map((r) => {
+                    const s = statusOf(r);
+                    const c = checkedOf(r);
+                    const key = `${r.kind}:${r.id}`;
+                    return (
+                      <tr key={key} className={`web-table-row${key === selectedId ? ' is-selected' : ''}`}>
+                        <th scope="row">
+                          <span className="rpl-cell-resource">
+                            <span className="rpl-plate rpl-plate--water" aria-hidden="true">
+                              <img src={`/icons/map/${r.kind}.svg`} alt="" width="16" height="16" />
+                            </span>
+                            <span className="rpl-cell-text">
+                              <span className="rpl-cell-title">{nameOf(r)}</span>
+                              <span className="rpl-cell-meta"><Place lat={r.latitude} lng={r.longitude} address={r.address} /></span>
+                            </span>
+                          </span>
+                        </th>
+                        <td><StatusChip label={s.label} tone={s.tone} /></td>
+                        <td>
+                          <span className="rpl-cell-text">
+                            <span className="rpl-cell-value">{c.title}</span>
+                            <span className="rpl-cell-meta">{c.at ?? '—'}</span>
+                          </span>
+                        </td>
+                        <td className="web-table-action-cell">
+                          <button
+                            type="button"
+                            className="rpl-icon-button"
+                            onClick={() => setSelectedId(key)}
+                            aria-label={t('Details and actions for {nameOf}', { nameOf: nameOf(r) })}
+                            aria-current={key === selectedId ? 'true' : undefined}
+                          >
+                            <Icon name="more" size={24} />
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {rows.length === 0 && (
+                    <tr><td className="web-table-empty" colSpan={4}>{t('Nothing matches these filters.')}</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="rpl-pager">
+              <span className="rpl-pager-range">
+                {rows.length === 0 ? t('Showing 0 of 0') : t('Showing {from}–{to} of {count}', { from: page * PAGE + 1, to: Math.min(rows.length, page * PAGE + PAGE), count: rows.length })}
+              </span>
+              {pages > 1 && (
+                <nav className="rpl-pager-pages" aria-label={t('Pages')}>
+                  <button type="button" className="rpl-page-button" onClick={() => setPage((p) => p - 1)} disabled={page === 0} aria-label={t('Previous page')}>‹</button>
+                  {Array.from({ length: pages }, (_, i) => (
+                    <button key={i} type="button" className={`rpl-page-button${i === page ? ' is-current' : ''}`} onClick={() => setPage(i)} aria-current={i === page ? 'page' : undefined}>{i + 1}</button>
+                  ))}
+                  <button type="button" className="rpl-page-button" onClick={() => setPage((p) => p + 1)} disabled={page >= pages - 1} aria-label={t('Next page')}>›</button>
+                </nav>
+              )}
+            </div>
+          </div>
+          {selected && <Detail row={selected} onClose={() => setSelectedId(null)} onDelete={() => setDeleting(selected)} />}
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={!!deleting}
+        eyebrow={deleting ? kindOf(deleting.kind).singular : undefined}
+        title={deleting ? t('Delete {nameOf}?', { nameOf: nameOf(deleting) }) : ''}
+        description={t('It disappears from every Admin’s map and every Coordinator’s water patrol. This can’t be undone; the deletion is recorded with your name.')}
+        confirmLabel={deleting ? t('Delete {thing}', { thing: kindOf(deleting.kind).singular.toLowerCase() }) : t('Delete')}
+        destructive
+        onClose={() => setDeleting(null)}
+        onConfirm={confirmDelete}
+      />
+    </div>
+  );
+}

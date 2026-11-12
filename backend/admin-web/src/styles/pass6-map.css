@@ -1,0 +1,189 @@
+/* Pass 6 — the live map (REPLIT (MAIN) 10 · A30, A31; 04 · Map marker, Map
+ * layer chip, Map overlays). Overlays over the dark tiles use Glass; panels
+ * that carry body text use Glass strong (03 · pass 6 materials). */
+
+/* ── Markers ──────────────────────────────────────────────────────────── */
+.rpl-marker { background: none; border: 0; }
+.rpl-marker-backing {
+  position: absolute;
+  left: 5px;
+  top: 5px;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: #131313;
+}
+.rpl-marker-backing.is-selected { left: 0; top: 0; width: 48px; height: 48px; border-radius: 14px; }
+.rpl-marker-disc {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 1.5px solid #fff;
+  border-radius: 8px;
+  box-sizing: border-box;
+}
+.rpl-marker-disc.is-selected { left: 4px; top: 4px; width: 40px; height: 40px; border-width: 2px; border-radius: 10px; }
+.rpl-marker-disc--incident { background: #b56648; }
+.rpl-marker-disc--water { background: #4168ae; }
+.rpl-marker-disc--shelter { background: #188c43; }
+.rpl-marker-disc--risk { background: #b53c37; }
+.rpl-marker-disc--unit { background: #626262; }
+/* Units (A30): trucks that would overlap share one marker — a second plate
+ * peeks out behind the first, and the count sits at the top right. */
+.rpl-unit .rpl-unit-behind { transform: translate(5px, -5px); }
+.rpl-unit-count {
+  position: absolute;
+  right: -2px;
+  top: -2px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  box-sizing: border-box;
+  border: 2px solid #626262;
+  border-radius: 10px;
+  background: #fff;
+  color: #1b1b1b;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+.rpl-unit.is-stale { opacity: 0.6; }
+.rpl-unit-tip { display: block; }
+.rpl-map-legend-note { margin: 10px 0 0; color: var(--text-3); font-size: 12px; max-width: 24ch; }
+
+/* ── Map frame ────────────────────────────────────────────────────────── */
+.rpl-map { position: relative; height: 100%; min-height: 0; background: var(--map-ground); }
+.rpl-map .leaflet-container { background: var(--map-ground); }
+.rpl-map-chips {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  right: 120px;
+  z-index: 500;
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.rpl-map-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-chip);
+  background: var(--glass);
+  backdrop-filter: blur(12px);
+  color: var(--text);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.rpl-map-chip.is-on { border-width: 1.5px; }
+.rpl-map-chip--accent.is-on { border-color: var(--accent); background: rgba(107, 60, 43, 0.6); }
+.rpl-map-chip--info.is-on { border-color: var(--info); background: rgba(31, 52, 92, 0.6); }
+.rpl-map-chip--ok.is-on { border-color: var(--ok); background: rgba(12, 60, 31, 0.6); }
+.rpl-map-chip--danger.is-on { border-color: var(--danger); background: rgba(92, 28, 26, 0.6); }
+.rpl-map-chip-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.rpl-map-chip--danger .rpl-map-chip-dot { background: var(--danger); }
+.rpl-map-chip--info .rpl-map-chip-dot { background: var(--info); }
+.rpl-map-chip--ok .rpl-map-chip-dot { background: var(--ok); }
+.rpl-map-chip--accent .rpl-map-chip-dot { background: var(--accent); }
+
+.rpl-map-tools {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 500;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rpl-map-tool {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--glass-strong);
+  backdrop-filter: blur(12px);
+  color: var(--text);
+  cursor: pointer;
+}
+.rpl-map-tool[aria-pressed="true"] { border-color: var(--accent-line); }
+
+.rpl-map-legend {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  z-index: 500;
+  width: 232px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--glass-strong);
+  backdrop-filter: blur(12px);
+}
+.rpl-map-legend ul { display: flex; flex-direction: column; gap: 10px; margin: 10px 0 0; padding: 0; list-style: none; }
+.rpl-map-legend li { display: flex; align-items: center; gap: 10px; color: var(--text-2); font-size: 13px; }
+.rpl-legend-mark {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border: 1px solid #fff;
+  border-radius: 5px;
+}
+
+.rpl-map-panel {
+  position: absolute;
+  top: 16px;
+  right: 80px;
+  z-index: 600;
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--glass-strong);
+  backdrop-filter: blur(16px);
+}
+.rpl-map-panel .web-chip { align-self: flex-start; }
+
+.rpl-map .leaflet-control-zoom a {
+  background: var(--glass-strong);
+  color: var(--text);
+  border-color: var(--line);
+}
+
+
+@media (max-width: 1023px) {
+  .rpl-map-panel { right: 16px; left: 16px; top: auto; bottom: 16px; width: auto; }
+  .rpl-map-legend { display: none; }
+}
+
+/* ── Water resources map (A33) ────────────────────────────────────────── */
+.rpl-water-map {
+  position: relative;
+  height: max(520px, calc(100vh - 360px));
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--map-ground);
+}
+.rpl-water-panel { right: 16px; }
+.rpl-stack { display: flex; flex-direction: column; gap: 16px; min-width: 0; }

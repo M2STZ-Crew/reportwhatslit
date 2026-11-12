@@ -1,0 +1,264 @@
+"""Incident lifecycle schemas (Phase 9, Section 9).
+
+An "incident" is a public.areas row plus its dispatch + responder context. Reads
+expose the 7 lifecycle timestamps and the current alarm level; the request bodies
+drive status transitions and the dispatch / responder-GPS writes (Parts 2-4).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+
+# --------------------------------------------------------------------------- #
+# Read models
+# --------------------------------------------------------------------------- #
+class IncidentReportItem(BaseModel):
+    """A member report contributing to an incident area."""
+
+    id: UUID
+    device_lat: float
+    device_lng: float
+    has_exif: bool
+    gps_discrepancy_flag: bool
+    user_verified_percent: int
+    selected_agencies: list[str] = Field(default_factory=list)
+    created_at: datetime
+
+
+class IncidentReportDetail(BaseModel):
+    """A member report with reviewer context: reporter name + signed photo URL."""
+
+    id: UUID
+    reporter_id: UUID | None = None
+    reporter_name: str | None = None
+    photo_url: str | None = None
+    device_lat: float
+    device_lng: float
+    has_exif: bool
+    gps_discrepancy_flag: bool
+    user_verified_percent: int
+    selected_agencies: list[str] = Field(default_factory=list)
+    notes: str | None = None
+    created_at: datetime
+
+
+class AvailableResponder(BaseModel):
+    """A response_team user a sub-admin can dispatch (for the dispatch crew picker)."""
+
+    id: UUID
+    full_name: str | None = None
+    agency_type: str | None = None
+    organization_id: UUID | None = None
+    is_busy: bool = False  # has an active dispatch to any incident
+    on_this_incident: bool = False  # already actively dispatched to this incident
+
+
+class IncidentStats(BaseModel):
+    """Counters for the responder dashboard (visibility / agency scoped)."""
+
+    active_incidents: int = 0
+    pending_verify: int = 0
+    units_deployed: int = 0
+    units_standby: int = 0
+    # Fire out, Post-Incident Report not yet filed — the captain's tray (v10 §2.5).
+    pending_reports: int = 0
+
+
+class IncidentSummary(BaseModel):
+    """Compact incident for the operational feed (visibility-filtered)."""
+
+    id: UUID
+    designation: str
+    status: str
+    centroid_lat: float
+    centroid_lng: float
+    report_count: int
+    confidence_score: float
+    confidence_band: str
+    alarm_level: str | None = None
+    active_dispatch_count: int = 0
+    reported_at: datetime
+    verified_at: datetime | None = None
+    dispatched_at: datetime | None = None
+    en_route_at: datetime | None = None
+    arrived_at: datetime | None = None
+    resolved_at: datetime | None = None
+    post_incident_report_at: datetime | None = None
+    closed_at: datetime | None = None
+    rejected_at: datetime | None = None
+    merged_at: datetime | None = None
+    updated_at: datetime
+    # Agencies the reporters asked for (union over member reports), the ones
+    # Admin has routed it to, and the observer agencies that pressed Accept.
+    requested_agencies: list[str] = Field(default_factory=list)
+    routed_agencies: list[str] = Field(default_factory=list)
+    accepted_agencies: list[str] = Field(default_factory=list)
+    # The organisations that acknowledged it. An Admin console shows "Acknowledged"
+    # for its own organisation from this: an agency can have many teams.
+    accepted_organization_ids: list[UUID] = Field(default_factory=list)
+    # Routing rows, all agencies and teams. Changes whenever Admin routes more,
+    # so a console can tell "routed to another team" from "now routed to mine".
+    route_count: int = 0
+
+
+class IncidentRoute(BaseModel):
+    """One Admin routing decision on an incident, and its observer Accept (v10 §2.6)."""
+
+    id: UUID
+    agency: str
+    organization_id: UUID | None = None
+    organization_name: str | None = None
+    routed_by: UUID | None = None
+    routed_by_name: str | None = None
+    routed_at: datetime
+    accepted_by: UUID | None = None
+    accepted_by_name: str | None = None
+    accepted_at: datetime | None = None
+
+
+class IncidentAcceptance(BaseModel):
+    """One Accept on an incident (v11 Section 2.5.1): who committed, for which agency.
+
+    The first is the Accept that verified the incident and sent responders;
+    each later one is another agency saying it is coming too. ``agency`` is null
+    for an Admin, who accepts for the system rather than for a team.
+    """
+
+    agency: str | None = None
+    user_id: UUID
+    user_name: str | None = None
+    organization_id: UUID | None = None
+    organization_name: str | None = None
+    is_first: bool = False
+    accepted_at: datetime
+
+
+class IncidentDetail(IncidentSummary):
+    """Full incident with confidence components, accountability, and member reports."""
+
+    n_score: float
+    s_score: float
+    v_score: float
+    version: int
+    parent_area_id: UUID | None = None
+    verified_by: UUID | None = None
+    verified_by_name: str | None = None
+    # The team the verifier verified it for, as it was when they pressed Verify
+    # (app/services/verifier.py); agency is null for an Admin.
+    verified_by_organization: str | None = None
+    verified_by_agency: str | None = None
+    resolved_by: UUID | None = None
+    resolved_by_name: str | None = None
+    closed_by: UUID | None = None
+    closed_by_name: str | None = None
+    rejected_by: UUID | None = None
+    rejected_by_name: str | None = None
+    rejection_reason: str | None = None
+    merged_by: UUID | None = None
+    merged_by_name: str | None = None
+    merged_into_area_id: UUID | None = None
+    alarm_level_set_by: UUID | None = None
+    alarm_level_set_at: datetime | None = None
+    has_post_incident_report: bool = False
+    routes: list[IncidentRoute] = Field(default_factory=list)
+    acceptances: list[IncidentAcceptance] = Field(default_factory=list)
+    reports: list[IncidentReportItem] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Request models (Parts 2-4)
+# --------------------------------------------------------------------------- #
+class IncidentRejectRequest(BaseModel):
+    """Reject an incident as invalid / a false report."""
+
+    reason: str = Field(
+        min_length=1, max_length=1000, description="Why the incident is being rejected."
+    )
+
+
+class ManualDispatchRequest(BaseModel):
+    """A sub-admin assigns a response_team member to an incident (manual dispatch)."""
+
+    responder_id: UUID = Field(description="The response_team user being dispatched.")
+    organization_id: UUID | None = Field(
+        default=None, description="Responder's organization, if applicable."
+    )
+    vehicle_name: str | None = Field(
+        default=None, max_length=200, description="The unit/truck this responder crews."
+    )
+    crew_role: str | None = Field(
+        default=None, max_length=100, description="Fireground role (e.g. Driver / Pump Op)."
+    )
+    notes: str | None = Field(default=None, max_length=1000)
+
+
+class SelfDispatchRequest(BaseModel):
+    """A response_team member self-selects onto an incident (self-select dispatch)."""
+
+    organization_id: UUID | None = Field(
+        default=None, description="Responder's organization, if applicable."
+    )
+    vehicle_name: str | None = Field(
+        default=None,
+        max_length=200,
+        description=(
+            "The unit this person is going on (a coordinator's Accept with "
+            "\"I am going too\"). A label on the response, as on the citizen's "
+            "tracking card; the Post-Incident Report still records the truck."
+        ),
+    )
+    notes: str | None = Field(default=None, max_length=1000)
+
+
+class ResponderLocationCreate(BaseModel):
+    """A single GPS fix posted by a responder during active response (5 s cadence)."""
+
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+    captured_at: datetime = Field(description="Device-side timestamp of the fix.")
+    accuracy_m: float | None = Field(default=None, ge=0)
+    speed_mps: float | None = Field(default=None, ge=0)
+    heading_deg: float | None = Field(default=None, ge=0, lt=360)
+    dispatch_id: UUID | None = Field(
+        default=None, description="The dispatch this fix belongs to, if known."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Dispatch / responder response models (Parts 3-4)
+# --------------------------------------------------------------------------- #
+class DispatchItem(BaseModel):
+    """A dispatch assignment row."""
+
+    id: UUID
+    area_id: UUID
+    responder_id: UUID
+    responder_name: str | None = None
+    organization_id: UUID | None = None
+    dispatch_type: str
+    dispatched_by: UUID | None = None
+    status: str
+    dispatched_at: datetime
+    withdrawn_at: datetime | None = None
+    completed_at: datetime | None = None
+    vehicle_name: str | None = None
+    crew_role: str | None = None
+    notes: str | None = None
+
+
+class ResponderLocationItem(BaseModel):
+    """The latest known location of a responder on an incident."""
+
+    responder_id: UUID
+    lat: float
+    lng: float
+    accuracy_m: float | None = None
+    speed_mps: float | None = None
+    heading_deg: float | None = None
+    captured_at: datetime
+    created_at: datetime
+    dispatch_id: UUID | None = None

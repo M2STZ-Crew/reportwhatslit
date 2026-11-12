@@ -1,0 +1,344 @@
+"""Incident reporting API (Phase 6).
+
+POST /reports/submit: multipart SOS submission — photo (<=5MB JPEG/PNG) + optional
+video (<=1.5MB MP4), device GPS, compass bearing (metadata only), multi-agency
+selection. Extracts EXIF GPS and cross-references it against the device GPS at a
+100 m threshold (Section 3.1), uploads media to Supabase Storage, and persists the
+report. Area clustering (Phase 7) consumes these rows.
+"""
+
+from __future__ import annotations
+
+from typing import Annotated
+from uuid import UUID, uuid4
+
+from asyncpg import Record
+from fastapi import APIRouter, File, Form, UploadFile, status
+
+from app.api.deps import CurrentUser, DatabaseDep, StorageClientDep
+from app.core.config import get_settings
+from app.core.exceptions import BadRequestError, ConflictError, ExternalServiceError
+from app.core.logging import get_logger
+from app.db.session import Database
+from app.integrations.fcm import PushService
+from app.schemas.report import ReportResponse, ReportSubmitResponse
+from app.services.clustering import cluster_report
+from app.services.exif import extract_gps, validate_image
+from app.services.geo import haversine_m
+from app.services.incident import active_area_sql
+from app.services.incident_notify import notify_staff_new_incident
+from app.services.map_feed import publish_area_change
+from app.workers.neighborhood import notify_area_neighbors
+
+log = get_logger(__name__)
+
+router = APIRouter(prefix="/reports", tags=["reports"])
+
+_VALID_AGENCIES = {"fire_volunteer", "bfp", "barangay", "medical", "police"}
+
+# Every RepLiT report is a fire report. The app locks its "Fire" choice on, and
+# the server holds to the same rule, so an older build, or a request made by
+# hand, cannot file a report that leaves the Fire Volunteers out of it.
+FIRE_AGENCY = "fire_volunteer"
+
+
+def _parse_agencies(raw: str) -> list[str]:
+    """Parse + validate a comma-separated agency list against agency_type values.
+
+    The Fire Volunteers are always first: added when the list leaves them out,
+    and never listed twice.
+    """
+    agencies = [a.strip() for a in raw.split(",") if a.strip()]
+    invalid = [a for a in agencies if a not in _VALID_AGENCIES]
+    if invalid:
+        raise BadRequestError(f"Invalid agency selection: {', '.join(invalid)}.")
+    return list(dict.fromkeys([FIRE_AGENCY, *agencies]))
+
+
+# How long a report can hold its reporter to one report at a time. The app lets
+# go of a report it is following after the same 12 h (ActiveReport.staleAfter),
+# so an area nobody ever picked up cannot stop someone reporting a new fire.
+IN_PROGRESS_HOURS = 12
+
+
+async def _report_in_progress(db: Database, user_id: UUID) -> Record | None:
+    """The caller's newest report whose incident is still live, if any."""
+    return await db.fetchrow(
+        f"""
+        select r.id as report_id, a.id as area_id, a.designation
+        from public.reports r
+        join public.area_reports ar on ar.report_id = r.id
+        join public.areas a on a.id = ar.area_id
+        where r.reporter_id = $1
+          and r.created_at > now() - make_interval(hours => $2)
+          and {active_area_sql("a")}
+        order by r.created_at desc
+        limit 1
+        """,
+        user_id,
+        IN_PROGRESS_HOURS,
+    )
+
+
+async def _sign_or_none(
+    storage: StorageClientDep, bucket: str, path: str | None
+) -> str | None:
+    """Sign a private object, returning None (not a 502) when it can't be signed.
+
+    A deleted/missing object makes Supabase return 400 on sign; without this, one
+    orphaned report would break the entire /reports/mine listing.
+    """
+    if not path:
+        return None
+    try:
+        return await storage.create_signed_url(bucket=bucket, path=path)
+    except ExternalServiceError:
+        log.warning("report_media_unsigned", bucket=bucket, path=path)
+        return None
+
+@router.post(
+    "/submit",
+    response_model=ReportSubmitResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Submit an incident report (SOS)",
+)
+async def submit_report(
+    user: CurrentUser,
+    db: DatabaseDep,
+    storage: StorageClientDep,
+    device_lat: Annotated[float, Form(ge=-90, le=90)],
+    device_lng: Annotated[float, Form(ge=-180, le=180)],
+    photo: Annotated[UploadFile, File(description="Incident photo, JPEG/PNG <=5MB")],
+    selected_agencies: Annotated[str, Form(description="Comma-separated agencies")] = "",
+    device_gps_accuracy_m: Annotated[float | None, Form()] = None,
+    compass_bearing: Annotated[float | None, Form(ge=0, lt=360)] = None,
+    notes: Annotated[str | None, Form(max_length=2000)] = None,
+    video: Annotated[UploadFile | None, File(description="Optional MP4 <=1.5MB")] = None,
+) -> ReportSubmitResponse:
+    """Validate, store, EXIF-cross-reference, and persist a citizen incident report."""
+    settings = get_settings()
+    agencies = _parse_agencies(selected_agencies)
+
+    # One report at a time: while the caller's last one is still a live incident,
+    # a second is refused. It is almost always the same fire sent again, and
+    # it would open a second area for responders to sort out.
+    pending = await _report_in_progress(db, user.id)
+    if pending is not None:
+        raise ConflictError(
+            "You already have a report in progress. Follow it in the app until "
+            "the fire is out. For a different emergency, call a hotline.",
+            error_code="report_in_progress",
+            details={
+                "report_id": str(pending["report_id"]),
+                "area_id": str(pending["area_id"]),
+                "area_designation": pending["designation"],
+            },
+        )
+
+    # --- Photo: validate type, size, and that it's a real image ---
+    photo_bytes = await photo.read()
+    if photo.content_type not in ("image/jpeg", "image/png"):
+        raise BadRequestError("Photo must be JPEG or PNG.")
+    if len(photo_bytes) > settings.report_max_photo_bytes:
+        raise BadRequestError("Photo exceeds the 5 MB limit.")
+    validate_image(photo_bytes)
+    photo_ext = ".png" if photo.content_type == "image/png" else ".jpg"
+
+    # --- Optional video: type + size only (resolution/duration are client-enforced) ---
+    video_bytes: bytes | None = None
+    if video is not None and video.filename:
+        video_bytes = await video.read()
+        if video.content_type != "video/mp4":
+            raise BadRequestError("Video must be MP4.")
+        if len(video_bytes) > settings.report_max_video_bytes:
+            raise BadRequestError("Video exceeds the 1.5 MB limit.")
+
+    # --- EXIF GPS + device-vs-EXIF cross-reference (Section 3.1) ---
+    exif = extract_gps(photo_bytes)
+    has_exif = exif is not None
+    exif_lat = exif[0] if exif is not None else None
+    exif_lng = exif[1] if exif is not None else None
+    gps_discrepancy_m: float | None = None
+    gps_discrepancy_flag = False
+    if exif is not None:
+        gps_discrepancy_m = haversine_m(device_lat, device_lng, exif[0], exif[1])
+        gps_discrepancy_flag = gps_discrepancy_m > settings.gps_discrepancy_threshold_m
+
+    # --- Upload media to Storage (path: <user_id>/<report_id>.<ext>) ---
+    report_id = uuid4()
+    photo_path = f"{user.id}/{report_id}{photo_ext}"
+    await storage.upload(
+        bucket="incident-photos",
+        path=photo_path,
+        content=photo_bytes,
+        content_type=photo.content_type or "image/jpeg",
+    )
+    video_path: str | None = None
+    if video_bytes is not None:
+        video_path = f"{user.id}/{report_id}.mp4"
+        await storage.upload(
+            bucket="incident-videos",
+            path=video_path,
+            content=video_bytes,
+            content_type="video/mp4",
+        )
+
+    # --- Persist ---
+    row = await db.fetchrow(
+        """
+        insert into public.reports (
+            id, reporter_id, device_lat, device_lng, device_gps_accuracy_m,
+            exif_lat, exif_lng, has_exif, gps_discrepancy_m, gps_discrepancy_flag,
+            compass_bearing, photo_url, photo_size_bytes, video_url, video_size_bytes,
+            selected_agencies, user_verified_percent, notes
+        ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+                  $16::public.agency_type[], $17, $18)
+        returning id, created_at
+        """,
+        report_id,
+        user.id,
+        device_lat,
+        device_lng,
+        device_gps_accuracy_m,
+        exif_lat,
+        exif_lng,
+        has_exif,
+        gps_discrepancy_m,
+        gps_discrepancy_flag,
+        compass_bearing,
+        photo_path,
+        len(photo_bytes),
+        video_path,
+        len(video_bytes) if video_bytes is not None else None,
+        agencies,
+        user.verified_percent,
+        notes,
+    )
+    
+    assert row is not None
+
+    area_id = await cluster_report(db, report_id=report_id, lat=device_lat, lng=device_lng)
+    area = await db.fetchrow(
+        "select designation, centroid_lat, centroid_lng, report_count "
+        "from public.areas where id = $1",
+        area_id,
+    )
+    assert area is not None
+
+    # Keep the reporter locatable for future incidents, then immediately alert
+    # nearby users (150 m) — they don't have to wait for the 60 s worker tick.
+    await db.execute(
+        "update public.users set latitude = $2, longitude = $3, "
+        "location_updated_at = now(), last_active_at = now() "
+        "where id = $1",
+        user.id,
+        device_lat,
+        device_lng,
+    )
+    # Centre the 150 m query on the area centroid, not this reporter's position
+    # (Section 3.5). Clustering has just recomputed the centroid, so for a report
+    # joining an existing area the two differ — using the reporter's coordinates
+    # would blast a different circle than every subsequent 60 s tick.
+    try:
+        await notify_area_neighbors(
+            db,
+            PushService(),
+            area_id,
+            float(area["centroid_lat"]),
+            float(area["centroid_lng"]),
+        )
+    except Exception:
+        log.error("immediate_neighbor_notify_failed", area_id=str(area_id), exc_info=True)
+    # The first report makes the incident: tell the staff who can see it, with
+    # the fire alarm (v1.12.6). A report joining a known fire is news on the
+    # dashboard, not another alarm.
+    if area["report_count"] == 1:
+        try:
+            await notify_staff_new_incident(db, area_id)
+        except Exception:
+            log.error("staff_new_incident_notify_failed", area_id=str(area_id), exc_info=True)
+    await publish_area_change(db, area_id)
+
+    if not has_exif:
+        note = "No EXIF GPS (e.g. gallery upload)."
+    elif gps_discrepancy_flag:
+        note = "GPS discrepancy flagged for Sub-Admin review."
+    else:
+        note = "Device and EXIF GPS agree."
+    log.info(
+        "report_submitted",
+        report_id=str(report_id),
+        user_id=str(user.id),
+        area_id=str(area_id),
+        has_exif=has_exif,
+        gps_discrepancy_flag=gps_discrepancy_flag,
+    )
+    return ReportSubmitResponse(
+        id=row["id"],
+        created_at=row["created_at"],
+        has_exif=has_exif,
+        gps_discrepancy_m=gps_discrepancy_m,
+        gps_discrepancy_flag=gps_discrepancy_flag,
+        area_id=area_id,
+        area_designation=area["designation"],
+        message=f"Report submitted. {note}",
+    )
+
+
+@router.get("/mine", response_model=list[ReportResponse], summary="List my reports")
+async def list_my_reports(
+    user: CurrentUser, db: DatabaseDep, storage: StorageClientDep
+) -> list[ReportResponse]:
+    """Return the caller's reports with signed media URLs and incident progress."""
+    # A report can sit in more than one area (the junction allows overlap zones),
+    # so pick one to report progress against: an active incident in preference to
+    # a closed one, then the most recent. Without this a reporter whose area was
+    # merged would see the absorbed area's stale status.
+    rows = await db.fetch(
+        f"""
+        select r.id, r.device_lat, r.device_lng, r.has_exif, r.gps_discrepancy_m,
+               r.gps_discrepancy_flag, r.compass_bearing, r.selected_agencies,
+               r.user_verified_percent, r.photo_url, r.video_url, r.created_at,
+               a.id as area_id,
+               a.designation as area_designation,
+               a.status::text as area_status,
+               a.confidence_band::text as area_confidence_band
+        from public.reports r
+        left join lateral (
+            select ar.area_id
+            from public.area_reports ar
+            join public.areas a2 on a2.id = ar.area_id
+            where ar.report_id = r.id
+            order by ({active_area_sql("a2")}) desc, a2.reported_at desc
+            limit 1
+        ) picked on true
+        left join public.areas a on a.id = picked.area_id
+        where r.reporter_id = $1
+        order by r.created_at desc
+        limit 100
+        """,
+        user.id,
+    )
+    items: list[ReportResponse] = []
+    for r in rows:
+        items.append(
+            ReportResponse(
+                id=r["id"],
+                device_lat=r["device_lat"],
+                device_lng=r["device_lng"],
+                has_exif=r["has_exif"],
+                gps_discrepancy_m=r["gps_discrepancy_m"],
+                gps_discrepancy_flag=r["gps_discrepancy_flag"],
+                compass_bearing=r["compass_bearing"],
+                selected_agencies=list(r["selected_agencies"]),
+                user_verified_percent=r["user_verified_percent"],
+                photo_url=await _sign_or_none(storage, "incident-photos", r["photo_url"]),
+                video_url=await _sign_or_none(storage, "incident-videos", r["video_url"]),
+                created_at=r["created_at"],
+                area_id=r["area_id"],
+                area_designation=r["area_designation"],
+                area_status=r["area_status"],
+                area_confidence_band=r["area_confidence_band"],
+            )
+        )
+    return items

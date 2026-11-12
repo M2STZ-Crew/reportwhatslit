@@ -1,0 +1,434 @@
+"""Incident-domain logic: agency visibility, lifecycle state machine, GPS persistence.
+
+Kept separate from the route module so the dispatch, responder-GPS, and WebSocket
+layers share the same visibility rule, status guards, and location writer.
+"""
+
+from __future__ import annotations
+
+from uuid import UUID
+
+from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
+from app.db.session import Database
+from app.schemas.auth import AuthenticatedUser
+from app.schemas.incident import ResponderLocationCreate
+from app.services.access import ALL_RECORDS, COORDINATE, admin_access
+
+# BFP and Fire Volunteers see each other's fire incidents (Section 6, two-way).
+_FIRE_AGENCIES = ("fire_volunteer", "bfp")
+
+# Agencies that may change an incident's state. The two fire agencies coordinate
+# the response, so their sub-admins reject, mark fire out, and may go to the fire
+# themselves (v12 Section 2.5).
+COORDINATING_AGENCIES = _FIRE_AGENCIES
+
+# Every other agency a reporter can summon — police, medical, barangay — takes
+# part for situational awareness only (Section 1.3 problem 9, cross-agency
+# silos). Their sub-admins see incidents that requested their agency and nothing
+# else: they must not be able to reject someone else's fire, resolve it, dispatch
+# Fire Volunteers, or press fire codes.
+OBSERVER_AGENCIES = ("police", "medical", "barangay")
+
+# Statuses nothing leaves (v10 Section 2.5). 'merged' is terminal for the
+# absorbed area only — its reports were moved onto the surviving area (Section
+# 2.3). 'closed' is reached only by filing the Post-Incident Report.
+TERMINAL_STATUSES = ("rejected", "merged", "closed")
+
+# Statuses that take an area out of the live feed: it must not cluster new
+# reports, alert neighbors, or count as an active incident. Wider than
+# TERMINAL_STATUSES because fire out ends the response before the paperwork is
+# done — a fire_out area waits in 'post_incident_report' (the captain's
+# "pending report" tray) without being live.
+OFF_FEED_STATUSES = ("fire_out", "post_incident_report", *TERMINAL_STATUSES)
+
+# Statuses that additionally bar an area from seeding a 1 h version chain.
+# The post-fire statuses are deliberately absent: a genuine second fire at the
+# same location within the hour is exactly what "Area 1.2" designates (Section
+# 2.3). A rejected area was never an incident, and a merged one was absorbed.
+UNVERSIONABLE_STATUSES = ("rejected", "merged")
+
+# Allowed forward transitions of public.area_status (v12 Section 2.5). Mirrors
+# the DB sequencing CHECK constraints: en_route needs verified, arrived needs
+# en_route, post_incident_report needs fire_out, closed needs
+# post_incident_report.
+#
+# v12 separates verifying from responding again. Verify moves reported ->
+# verified and nothing more; the first person to respond moves verified ->
+# en_route, which is when the citizen sees "On the way". (v11 had collapsed the
+# two into one Accept, so nobody decided to go — the incident just went.)
+#
+# Reject is open until someone is on scene: a mistaken verify can be undone even
+# after a responder has set off, and the reject releases them. Once someone has
+# arrived, a false alarm is recorded on the Post-Incident Report instead. Merge
+# is only legal before anyone responds — after that it would orphan their
+# assignments. 'fire_out' only ever moves on to the report step, and 'closed' is
+# additionally pinned by a trigger to the existence of a filed report.
+ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+    "reported": {"verified", "rejected", "merged"},
+    "verified": {"en_route", "fire_out", "rejected", "merged"},
+    "en_route": {"arrived", "fire_out", "rejected"},
+    "arrived": {"fire_out"},
+    "fire_out": {"post_incident_report"},
+    "post_incident_report": {"closed"},
+    "closed": set(),
+    "rejected": set(),
+    "merged": set(),
+}
+
+
+def _status_exclusion_sql(statuses: tuple[str, ...], alias: str) -> str:
+    """Render ``[alias.]status not in (...)`` for a tuple of area_status values."""
+    prefix = f"{alias}." if alias else ""
+    values = ", ".join(f"'{status}'" for status in statuses)
+    return f"{prefix}status not in ({values})"
+
+
+def active_area_sql(alias: str = "") -> str:
+    """SQL predicate restricting ``public.areas`` to live incidents.
+
+    Single source of truth for every query that filters the active feed — clustering,
+    overlap detection, the neighborhood worker, and both read routes — so a status
+    added to the enum can't be handled in some of them and missed in others.
+    ``alias`` qualifies the column when the query joins areas under a table alias.
+    """
+    return _status_exclusion_sql(OFF_FEED_STATUSES, alias)
+
+
+def versionable_area_sql(alias: str = "") -> str:
+    """SQL predicate for areas eligible to seed a 1 h version chain (Section 3.4).
+
+    Looser than :func:`active_area_sql` by design — see ``UNVERSIONABLE_STATUSES``.
+    """
+    return _status_exclusion_sql(UNVERSIONABLE_STATUSES, alias)
+
+
+def visible_agencies(user: AuthenticatedUser) -> list[str] | None:
+    """Agencies whose incidents this user may see; ``None`` means all (admin)."""
+    if user.role == "admin":
+        return None
+    if user.agency_type in _FIRE_AGENCIES:
+        return list(_FIRE_AGENCIES)
+    if user.agency_type:
+        return [user.agency_type]
+    return []
+
+
+def requested_sql(area: str, agencies_param: int) -> str:
+    """SQL predicate: the Area ``area`` (an SQL expression) has a member report
+    that asked for one of the agencies in parameter ``agencies_param``."""
+    return (
+        "exists (select 1 from public.area_reports ar "
+        "join public.reports r on r.id = ar.report_id "
+        f"where ar.area_id = {area} "
+        f"and r.selected_agencies && ${agencies_param}::public.agency_type[])"
+    )
+
+
+def took_part_sql(area: str, org_param: int) -> str:
+    """SQL predicate: the organisation in parameter ``org_param`` took part in
+    the Area ``area`` — someone of it acknowledged it, responded to it, or
+    filed its Post-Incident Report.
+
+    What an organisation's Admin may read of an incident's reports (pass 6
+    A00: "Reports and CIAR — Areas you took part in").
+    """
+    return (
+        "(exists (select 1 from public.area_acceptances x "
+        f"where x.area_id = {area} and x.organization_id = ${org_param}) "
+        "or exists (select 1 from public.dispatch_logs d "
+        f"where d.area_id = {area} and d.status <> 'withdrawn' "
+        f"and d.organization_id = ${org_param}) "
+        "or exists (select 1 from public.post_incident_reports pr "
+        f"where pr.area_id = {area} and pr.organization_id = ${org_param}))"
+    )
+
+
+async def assert_admin_routed(
+    db: Database, incident_id: UUID, user: AuthenticatedUser, action: str
+) -> None:
+    """Raise 403 unless this Admin's organisation was asked for the incident.
+
+    Every Admin sees every active incident, but acts only where its agency was
+    asked (PRD §4.6.2; pass 6 A25 "view only"). Does nothing for anyone who is
+    not an Admin, or for the system Admin, who acts on every incident.
+    """
+    access = admin_access(user)
+    if access is None or access.act_agencies is None:
+        return
+    routed = bool(access.act_agencies) and await db.fetchval(
+        f"select {requested_sql('$1', 2)}", incident_id, list(access.act_agencies)
+    )
+    if not routed:
+        raise ForbiddenError(
+            f"This incident didn't ask for {access.routed_word()}, so "
+            f"{access.organization_name or 'your organization'} can follow it but "
+            f"not {action}.",
+            details={"access": "view_only", "act_agencies": list(access.act_agencies)},
+        )
+
+
+def visible_area_sql(agencies_param: int, alias: str = "a") -> str:
+    """SQL predicate: the area has a member report that asked for one of the agencies.
+
+    ``agencies_param`` is the positional parameter holding the agency list. This
+    is the whole of incident visibility (Section 2.6.1): an agency sees the areas
+    a reporter asked it to, BFP and Fire Volunteer see each other's.
+    """
+    return (
+        "exists (select 1 from public.area_reports ar "
+        "join public.reports r on r.id = ar.report_id "
+        f"where ar.area_id = {alias}.id "
+        f"and r.selected_agencies && ${agencies_param}::public.agency_type[])"
+    )
+
+
+async def assert_incident_visible(
+    db: Database, incident_id: UUID, user: AuthenticatedUser
+) -> str:
+    """Return the incident's status, or raise 404 (missing) / 403 (not your agency's)."""
+    status_val = await db.fetchval(
+        "select status::text from public.areas where id = $1", incident_id
+    )
+    if status_val is None:
+        raise NotFoundError("Incident not found.")
+    agencies = visible_agencies(user)
+    if agencies is None:
+        return str(status_val)
+    visible = bool(agencies) and await db.fetchval(
+        f"select {visible_area_sql(2)} from public.areas a where a.id = $1",
+        incident_id,
+        agencies,
+    )
+    if not visible:
+        raise ForbiddenError("This incident is not visible to your agency.")
+    return str(status_val)
+
+
+def is_team_captain(user: AuthenticatedUser) -> bool:
+    """A Fire Volunteer or BFP sub-admin: the captain who files for a team."""
+    return user.role == "sub_admin" and user.agency_type in COORDINATING_AGENCIES
+
+
+def responded_sql(area: str, user_param: int, team_param: int, captain_param: int) -> str:
+    """SQL predicate: the caller responded to ``area``, or their team did.
+
+    Someone responded if they have a response on the Area that was not
+    withdrawn. A team captain also counts when anyone on their team responded,
+    or their team filed a Post-Incident Report for it — they file for the team
+    whether or not they rode the truck. ``area`` is an SQL expression (a column
+    or a parameter); the three parameters are :func:`responded_params`.
+    """
+    return (
+        "(exists (select 1 from public.dispatch_logs d "
+        f"where d.area_id = {area} and d.status <> 'withdrawn' "
+        f"and (d.responder_id = ${user_param} "
+        f"or (${captain_param}::boolean and d.organization_id = ${team_param}))) "
+        f"or (${captain_param}::boolean and exists ("
+        "select 1 from public.post_incident_reports pr "
+        f"where pr.area_id = {area} "
+        f"and coalesce(pr.organization_id, pr.filed_by) = ${team_param})))"
+    )
+
+
+def responded_params(user: AuthenticatedUser) -> tuple[UUID, UUID, bool]:
+    """The values :func:`responded_sql` compares: the user, their team, captain or not."""
+    return user.id, user.primary_org_id or user.id, is_team_captain(user)
+
+
+async def assert_responded(db: Database, incident_id: UUID, user: AuthenticatedUser) -> None:
+    """Raise 403 unless the caller responded to the incident.
+
+    Post-Incident Reports — and what is made from them, the AI summary and the
+    PDF — are for the people who went, not every firefighter who can see the
+    incident on the map. An organisation's Admin reads them when its
+    organisation took part (pass 6 A00); the system Admin reads every one.
+    """
+    access = admin_access(user)
+    if access is not None:
+        if access.can(ALL_RECORDS):
+            return
+        took_part = access.organization_id is not None and await db.fetchval(
+            f"select {took_part_sql('$1', 2)}", incident_id, access.organization_id
+        )
+        if not took_part:
+            raise ForbiddenError(
+                "This incident's reports are for the organizations that took part "
+                "in it, and yours did not."
+            )
+        return
+    responded = await db.fetchval(
+        f"select {responded_sql('$1', 2, 3, 4)}", incident_id, *responded_params(user)
+    )
+    if not responded:
+        raise ForbiddenError(
+            "Only the people who responded to this incident can read its reports."
+        )
+
+
+def is_coordinator(user: AuthenticatedUser) -> bool:
+    """True when the user may change an incident's state.
+
+    The system Admin keeps full authority as the system owner. An
+    organisation's Admin acknowledges and nothing more: rejecting, fire out and
+    dispatch are its Coordinators' (PRD §4.5.2, §4.6.1). Among sub-admins only
+    the fire agencies coordinate; an observer sub-admin (police, medical,
+    barangay) is read-only on incidents no matter which one requested their
+    agency.
+    """
+    access = admin_access(user)
+    if access is not None:
+        return access.can(COORDINATE)
+    return user.role == "sub_admin" and user.agency_type in COORDINATING_AGENCIES
+
+
+def is_observer(user: AuthenticatedUser) -> bool:
+    """True for a sub-admin whose agency only observes (police, medical, barangay)."""
+    return user.role == "sub_admin" and user.agency_type in OBSERVER_AGENCIES
+
+
+def assert_coordinator(user: AuthenticatedUser, action: str) -> None:
+    """Raise 403 unless the user may change incident state.
+
+    The message names the caller's own agency rather than saying "forbidden", so
+    a Barangay sub-admin who taps something understands they are an observer
+    rather than assuming the system is broken.
+    """
+    if is_coordinator(user):
+        return
+    if is_observer(user):
+        raise ForbiddenError(
+            f"Your agency takes part for situational awareness only, so it cannot "
+            f"{action}. Fire Volunteer or BFP coordinators handle this.",
+            details={"agency_type": user.agency_type, "access": "observer"},
+        )
+    if user.role == "admin":
+        raise ForbiddenError(
+            f"An organization's Admin acknowledges incidents but does not {action}: "
+            "its Coordinators do, from the mobile app.",
+            details={"access": "admin"},
+        )
+    raise ForbiddenError(f"You do not have permission to {action}.")
+
+
+def assert_team_captain(user: AuthenticatedUser) -> None:
+    """Raise 403 unless the user may file a Post-Incident Report (v10 Section 2.5).
+
+    The responding team captain files — a sub-admin of a coordinating (fire)
+    agency, on behalf of everyone who went. Response Team members do not file
+    individually, an observer agency has no truck or crew on the fireground, and
+    Admin routes incidents rather than captaining a team.
+    """
+    if user.role == "sub_admin" and user.agency_type in COORDINATING_AGENCIES:
+        return
+    if is_observer(user):
+        raise ForbiddenError(
+            "Your agency takes part for situational awareness only, so it cannot "
+            "file a Post-Incident Report. The responding Fire Volunteer or BFP team "
+            "captain files it.",
+            details={"agency_type": user.agency_type, "access": "observer"},
+        )
+    raise ForbiddenError(
+        "Only the responding team captain (a Fire Volunteer or BFP sub-admin) files "
+        "the Post-Incident Report."
+    )
+
+
+def assert_can_verify(user: AuthenticatedUser) -> None:
+    """Raise 403 unless the user may verify an incident (v12 Section 2.5.1).
+
+    Verifying says "this is a real fire"; it sends nobody. Anyone on a
+    responding agency who can reach the incident may do it: Admin, every
+    sub-admin (coordinators and observers), and — new in v12 — response team
+    members, because the one captain who used to hold this power may be away
+    from their phone, asleep, or on another fire when the report comes in.
+
+    Role is all this checks. Which Areas a non-admin may reach is scoped by
+    ``visible_agencies`` on the route, so each only ever verifies incidents that
+    asked for their agency. Citizens never can.
+    """
+    if user.role in ("admin", "sub_admin", "response_team"):
+        return
+    raise ForbiddenError(
+        "Only responders, team captains and Admin may verify incidents.",
+        details={"role": user.role},
+    )
+
+
+def can_respond(user: AuthenticatedUser) -> bool:
+    """Whether the user may go to a fire: any response team member, or a
+    Fire Volunteer / BFP coordinator (v12 Section 2.5.2). Observer captains
+    watch from the web and Admin runs the system; neither goes to the scene."""
+    if user.role == "response_team":
+        return True
+    return user.role == "sub_admin" and user.agency_type in COORDINATING_AGENCIES
+
+
+def assert_can_respond(user: AuthenticatedUser) -> None:
+    """Raise 403 unless the user may respond to (go to) an incident."""
+    if can_respond(user):
+        return
+    if is_observer(user):
+        raise ForbiddenError(
+            "Your agency takes part for situational awareness only, so its captains "
+            "do not respond from here. Your responders can respond from the app.",
+            details={"agency_type": user.agency_type, "access": "observer"},
+        )
+    raise ForbiddenError(
+        "Only responders and Fire Volunteer or BFP coordinators may respond to "
+        "incidents.",
+        details={"role": user.role},
+    )
+
+
+def assert_transition(current: str, target: str) -> None:
+    """Raise 409 if ``current -> target`` is not an allowed lifecycle transition."""
+    if target not in ALLOWED_TRANSITIONS.get(current, set()):
+        raise ConflictError(
+            f"Cannot move an incident from '{current}' to '{target}'.",
+            details={
+                "current_status": current,
+                "target_status": target,
+                "allowed": sorted(ALLOWED_TRANSITIONS.get(current, set())),
+            },
+        )
+
+
+async def record_responder_location(
+    db: Database,
+    incident_id: UUID,
+    responder_id: UUID,
+    payload: ResponderLocationCreate,
+) -> bool:
+    """Persist a GPS fix iff the responder has an active dispatch here; True if recorded."""
+    active_id = await db.fetchval(
+        """
+        select id from public.dispatch_logs
+        where area_id = $1 and responder_id = $2 and status = 'active'
+        order by dispatched_at desc
+        limit 1
+        """,
+        incident_id,
+        responder_id,
+    )
+    if active_id is None:
+        return False
+    # The fix belongs to the dispatch the server found, not to whatever id the
+    # phone sent: a client-supplied dispatch_id could name someone else's.
+    await db.execute(
+        """
+        insert into public.responder_locations
+            (responder_id, area_id, dispatch_id, lat, lng, accuracy_m, speed_mps,
+             heading_deg, captured_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        """,
+        responder_id,
+        incident_id,
+        active_id,
+        payload.lat,
+        payload.lng,
+        payload.accuracy_m,
+        payload.speed_mps,
+        payload.heading_deg,
+        payload.captured_at,
+    )
+    return True

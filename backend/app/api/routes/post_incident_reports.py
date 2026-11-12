@@ -1,0 +1,417 @@
+"""Post-Incident Report endpoints (v10 Section 2.5): file, read, list.
+
+During a response, coordinators and responders capture only what is needed to
+run it. The full record — when it happened and when the fire was out, the units,
+driver, roster and equipment taken — is filed here once the fire is out, by the
+responding team captain, for everyone who went. Every answer is a selection.
+
+Fire out (POST /incidents/{id}/resolve) leaves the incident in
+'post_incident_report'; filing is the only route to 'closed'. The form is
+single-submit with no draft state: the report and the close commit together in
+one transaction, and a database trigger refuses 'closed' without a report row.
+Named "Post-Incident Report" throughout because ``audit_logs`` already means the
+append-only action record.
+
+One report per responding team. A fire is often fought by more than one team,
+and each captain records their own units, crew and equipment. The first report
+filed closes the incident; the others are added to the closed incident, one per
+organisation. /post-incident-reports/owed is each captain's tray of the ones
+their team has still to file.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+from uuid import UUID
+
+import asyncpg
+from fastapi import APIRouter, BackgroundTasks, Query, Request, status
+
+from app.api.deps import DatabaseDep, StaffUser
+from app.api.routes.incidents import _SUMMARY_COLS, finish_incident_change
+from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
+from app.core.logging import get_logger
+from app.db.session import Database
+from app.schemas.auth import AuthenticatedUser
+from app.schemas.incident import IncidentSummary
+from app.schemas.post_incident_report import (
+    PostIncidentReportCreate,
+    PostIncidentReportResponse,
+)
+from app.services.access import ALL_RECORDS, admin_access
+from app.services.ai_summary import summarize_in_background
+from app.services.audit import record_audit
+from app.services.incident import (
+    COORDINATING_AGENCIES,
+    assert_incident_visible,
+    assert_responded,
+    assert_team_captain,
+    assert_transition,
+    responded_params,
+    responded_sql,
+    took_part_sql,
+    visible_agencies,
+    visible_area_sql,
+)
+
+log = get_logger(__name__)
+
+router = APIRouter(tags=["post_incident_reports"])
+
+# A report filed before the times and units were recorded has them null: the
+# incident's own timestamps and the single truck stand in, so every report reads
+# back in one shape.
+_REPORT_SELECT = """
+    select p.id, p.area_id, a.designation as area_designation, a.resolved_at,
+           coalesce(p.incident_at, a.reported_at) as incident_at,
+           coalesce(p.fire_out_at, a.resolved_at) as fire_out_at,
+           p.filed_by, p.filed_by_name, p.filed_by_role::text as filed_by_role,
+           p.filed_by_agency::text as filed_by_agency,
+           p.organization_id, o.name as organization_name,
+           p.units, p.truck_equipment_id, p.truck_label, p.truck_type,
+           p.driver_name, p.driver_user_id, p.roster, p.equipment_taken, p.notes,
+           p.false_alarm, p.false_alarm_note, p.submitted_at
+    from public.post_incident_reports p
+    join public.areas a on a.id = p.area_id
+    left join public.organizations o on o.id = p.organization_id
+"""
+
+
+_ALREADY_FILED = "Your team has already filed its Post-Incident Report for this incident."
+
+
+def _to_response(row: Any) -> PostIncidentReportResponse:
+    data = dict(row)
+    if isinstance(data.get("roster"), str):
+        data["roster"] = json.loads(data["roster"])
+    units = data.get("units")
+    if isinstance(units, str):
+        units = json.loads(units)
+    data["units"] = units or [
+        {
+            "name": data["truck_label"],
+            "type": data["truck_type"],
+            "equipment_id": data.get("truck_equipment_id"),
+        }
+    ]
+    data["equipment_taken"] = list(data.get("equipment_taken") or [])
+    return PostIncidentReportResponse.model_validate(data)
+
+
+# Whose report a row is: the organisation's, or - for a captain whose account
+# has none - the captain's own. Mirrors the unique index
+# post_incident_reports_one_per_team_idx.
+_TEAM_SQL = "coalesce(p.organization_id, p.filed_by)"
+
+
+def _team_of(user: AuthenticatedUser) -> UUID:
+    """The team a captain files for: their organisation, else themselves."""
+    return user.primary_org_id or user.id
+
+
+async def _load_reports(db: Database, incident_id: UUID) -> list[PostIncidentReportResponse]:
+    """Every team's report on one incident, in the order they were filed."""
+    rows = await db.fetch(
+        f"{_REPORT_SELECT} where p.area_id = $1 order by p.submitted_at asc", incident_id
+    )
+    return [_to_response(r) for r in rows]
+
+
+async def _load_team_report(
+    db: Database, incident_id: UUID, team: UUID
+) -> PostIncidentReportResponse | None:
+    row = await db.fetchrow(
+        f"{_REPORT_SELECT} where p.area_id = $1 and {_TEAM_SQL} = $2", incident_id, team
+    )
+    return _to_response(row) if row is not None else None
+
+
+@router.post(
+    "/incidents/{incident_id}/post-incident-report",
+    response_model=PostIncidentReportResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="File my team's Post-Incident Report; the first one closes the incident",
+)
+async def file_post_incident_report(
+    incident_id: UUID,
+    payload: PostIncidentReportCreate,
+    request: Request,
+    user: StaffUser,
+    db: DatabaseDep,
+    background: BackgroundTasks,
+) -> PostIncidentReportResponse:
+    """File once per team, fully filled.
+
+    The first report moves the incident post_incident_report -> closed. A
+    captain of another team that fought the same fire files theirs afterwards,
+    onto the closed incident; a team cannot file twice.
+
+    Filing also schedules the AI post-incident summary, rewritten each time so
+    it covers every team's report filed so far. It used to run at fire out, but
+    the reports are filed after that, so a summary written then could never
+    include them.
+    """
+    assert_team_captain(user)
+    await assert_incident_visible(db, incident_id, user)
+    team = _team_of(user)
+
+    unit_ids = [u.equipment_id for u in payload.units if u.equipment_id is not None]
+    if unit_ids:
+        known = await db.fetchval(
+            "select count(*) from public.equipment where id = any($1::uuid[])", unit_ids
+        )
+        if known != len(set(unit_ids)):
+            raise BadRequestError("One of those units is not in the equipment register.")
+
+    # The times default to what the system recorded; the captain changes them
+    # only when the record is off.
+    times = await db.fetchrow(
+        "select reported_at, resolved_at from public.areas where id = $1", incident_id
+    )
+    if times is None:
+        raise NotFoundError("Incident not found.")
+    incident_at = payload.incident_at or times["reported_at"]
+    fire_out_at = payload.fire_out_at or times["resolved_at"]
+    if incident_at is not None and fire_out_at is not None and fire_out_at < incident_at:
+        raise BadRequestError("The fire cannot be out before the incident happened.")
+
+    roster = [member.model_dump(mode="json", exclude_none=True) for member in payload.roster]
+    units = [unit.model_dump(mode="json") for unit in payload.units]
+    async with db.acquire() as conn, conn.transaction():
+        # Lock the area so two captains filing at once cannot both pass the check.
+        current = await conn.fetchval(
+            "select status::text from public.areas where id = $1 for update", incident_id
+        )
+        if current is None:
+            raise NotFoundError("Incident not found.")
+        current = str(current)
+        # Already closed: another team filed first, and this one adds its own.
+        closing = current != "closed"
+        if closing:
+            assert_transition(current, "closed")
+        if await conn.fetchval(
+            f"select 1 from public.post_incident_reports p "
+            f"where p.area_id = $1 and {_TEAM_SQL} = $2",
+            incident_id,
+            team,
+        ):
+            raise ConflictError(_ALREADY_FILED)
+        try:
+            report_id = await conn.fetchval(
+                """
+                insert into public.post_incident_reports
+                    (area_id, filed_by, filed_by_name, filed_by_role, filed_by_agency,
+                     organization_id, truck_equipment_id, truck_label, truck_type,
+                     driver_name, driver_user_id, roster, equipment_taken, notes,
+                     false_alarm, false_alarm_note, incident_at, fire_out_at, units)
+                values ($1, $2, $3, $4::public.user_role, $5::public.agency_type,
+                        $6, $7, $8, $9, $10, $11, $12::jsonb, $13::text[], $14,
+                        $15, $16, $17, $18, $19::jsonb)
+                returning id
+                """,
+                incident_id,
+                user.id,
+                user.full_name or user.email,
+                user.role,
+                user.agency_type,
+                user.primary_org_id,
+                # The single-truck columns are NOT NULL and older readers use
+                # them: they hold the first unit's link and the units as a line.
+                payload.units[0].equipment_id,
+                payload.unit_names,
+                payload.unit_types,
+                payload.driver_name,
+                payload.driver_user_id,
+                json.dumps(roster),
+                payload.equipment_taken,
+                payload.notes,
+                payload.false_alarm,
+                payload.false_alarm_note,
+                incident_at,
+                fire_out_at,
+                json.dumps(units),
+            )
+        except asyncpg.UniqueViolationError as exc:
+            raise ConflictError(_ALREADY_FILED) from exc
+        if closing:
+            await conn.execute(
+                "update public.areas set status = 'closed', closed_by = $2 where id = $1",
+                incident_id,
+                user.id,
+            )
+        await record_audit(
+            conn,
+            request,
+            user,
+            action="incident.post_incident_report",
+            entity_type="post_incident_report",
+            entity_id=report_id,
+            area_id=incident_id,
+            before_state={"status": current},
+            after_state={
+                "status": "closed",
+                "closed_the_incident": closing,
+                "units": payload.unit_names,
+                "driver_name": payload.driver_name,
+                "roster_count": len(roster),
+                "equipment_count": len(payload.equipment_taken),
+                "false_alarm": payload.false_alarm,
+            },
+        )
+
+    log.info(
+        "post_incident_report_filed",
+        incident_id=str(incident_id),
+        report_id=str(report_id),
+        user_id=str(user.id),
+    )
+    # Only the first report changes what a reporter sees; a later one is news to
+    # staff alone.
+    await finish_incident_change(
+        db, incident_id, "incident_closed" if closing else "post_incident_report_added"
+    )
+    background.add_task(summarize_in_background, incident_id)
+    report = await _load_team_report(db, incident_id, team)
+    assert report is not None
+    return report
+
+
+@router.get(
+    "/incidents/{incident_id}/post-incident-report",
+    response_model=PostIncidentReportResponse,
+    summary="Read an incident's Post-Incident Report",
+)
+async def get_post_incident_report(
+    incident_id: UUID, user: StaffUser, db: DatabaseDep
+) -> PostIncidentReportResponse:
+    """One report for the incident: the caller's own team's if it has filed,
+    otherwise the first that was. 404 while none is.
+
+    Kept for clients that show a single report; /post-incident-reports (plural,
+    below) returns every team's.
+    """
+    await assert_incident_visible(db, incident_id, user)
+    await assert_responded(db, incident_id, user)
+    report = await _load_team_report(db, incident_id, _team_of(user))
+    if report is None:
+        reports = await _load_reports(db, incident_id)
+        report = reports[0] if reports else None
+    if report is None:
+        raise NotFoundError("No Post-Incident Report has been filed for this incident yet.")
+    return report
+
+
+@router.get(
+    "/incidents/{incident_id}/post-incident-reports",
+    response_model=list[PostIncidentReportResponse],
+    summary="Every team's Post-Incident Report for one incident",
+)
+async def list_incident_post_incident_reports(
+    incident_id: UUID, user: StaffUser, db: DatabaseDep
+) -> list[PostIncidentReportResponse]:
+    """All the reports filed on an incident, in filing order; empty while none is."""
+    await assert_incident_visible(db, incident_id, user)
+    await assert_responded(db, incident_id, user)
+    return await _load_reports(db, incident_id)
+
+
+@router.get(
+    "/post-incident-reports/owed",
+    response_model=list[IncidentSummary],
+    summary="Incidents my team still owes a Post-Incident Report for (team captain)",
+)
+async def list_owed_post_incident_reports(
+    user: StaffUser, db: DatabaseDep
+) -> list[IncidentSummary]:
+    """The captain's tray: fire out, and their team has not filed.
+
+    An incident nobody has filed for is owed by every captain who can see it -
+    any of them may file first, as before. Once it is closed by another team's
+    report, it stays in the tray only of a team that actually responded to it
+    (someone in the organisation pressed Respond, or the captain did), so a
+    closed incident does not sit in every other captain's tray for ever.
+    Anyone who is not a team captain owes nothing.
+    """
+    if not (user.role == "sub_admin" and user.agency_type in COORDINATING_AGENCIES):
+        return []
+    agencies = visible_agencies(user)
+    if not agencies:
+        return []
+    rows = await db.fetch(
+        f"""
+        select {_SUMMARY_COLS}
+        from public.areas a
+        where {visible_area_sql(1)}
+          and (
+            a.status = 'post_incident_report'
+            or (
+              a.status = 'closed'
+              and exists (
+                select 1 from public.dispatch_logs d
+                where d.area_id = a.id and d.status <> 'withdrawn'
+                  and (d.organization_id = $2 or d.responder_id = $3)
+              )
+            )
+          )
+          and not exists (
+            select 1 from public.post_incident_reports p
+            where p.area_id = a.id and {_TEAM_SQL} = $2
+          )
+        order by a.resolved_at asc nulls last
+        limit 200
+        """,
+        agencies,
+        _team_of(user),
+        user.id,
+    )
+    return [IncidentSummary.model_validate(dict(r)) for r in rows]
+
+
+@router.get(
+    "/post-incident-reports",
+    response_model=list[PostIncidentReportResponse],
+    summary="List Post-Incident Reports visible to me",
+)
+async def list_post_incident_reports(
+    user: StaffUser,
+    db: DatabaseDep,
+    area_id: UUID | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[PostIncidentReportResponse]:
+    """Filed reports, newest first: those of incidents the caller responded to
+    (a captain: their team did) and their agency can see. An organisation's
+    Admin: incidents its organisation took part in. The system Admin: all."""
+    agencies = visible_agencies(user)
+    if agencies is not None and not agencies:
+        return []
+    conditions: list[str] = []
+    params: list[Any] = []
+    if agencies is not None:
+        params.append(agencies)
+        conditions.append(visible_area_sql(len(params)))
+    access = admin_access(user)
+    if access is None:
+        start = len(params) + 1
+        params.extend(responded_params(user))
+        conditions.append(responded_sql("p.area_id", start, start + 1, start + 2))
+    elif not access.can(ALL_RECORDS):
+        if access.organization_id is None:
+            return []
+        params.append(access.organization_id)
+        conditions.append(took_part_sql("p.area_id", len(params)))
+    if area_id is not None:
+        params.append(area_id)
+        conditions.append(f"p.area_id = ${len(params)}")
+    params.append(limit)
+    limit_pos = len(params)
+    params.append(offset)
+    offset_pos = len(params)
+    where_sql = f"where {' and '.join(conditions)}" if conditions else ""
+    rows = await db.fetch(
+        f"{_REPORT_SELECT} {where_sql} "
+        f"order by p.submitted_at desc limit ${limit_pos} offset ${offset_pos}",
+        *params,
+    )
+    return [_to_response(r) for r in rows]

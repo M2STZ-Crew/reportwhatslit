@@ -1,0 +1,185 @@
+import { AGENCY_LABEL, ago } from '../../lib/status.js';
+import Place from '../Place.jsx';
+import { RAIL_BELOW, useMedia } from '../../lib/useMedia.js';
+import Icon from '../ui/Icon.jsx';
+import StatusChip from '../ui/StatusChip.jsx';
+import LifecycleChip from './LifecycleChip.jsx';
+import Skeleton from '../ui/Skeleton.jsx';
+import { t } from '../../i18n/i18n.jsx';
+
+/* The incident list (REPLIT (MAIN) 04 · Incident row; PRD v13 §4.6.2, §4.14):
+ * the Area and where it is, its status, the agencies its reporters asked for,
+ * confidence, how many reports, and when it last changed. Unread — reported
+ * since this surface was last viewed — is a coral dot and a coral edge.
+ *
+ * "Your org" (Routed to you / Acknowledged / View only) is drawn when the
+ * caller passes `yourOrg(inc)` — for an Admin that acts on some Areas only
+ * (lib/access.js); for one that acts on every Area it would say the same on
+ * every row. The address line is the street, looked up by the console until
+ * the server stores resolved_address (PRD v13 §4.10), beside the degrees.
+ *
+ * Below 1280 px, beside the rail, the rows stack as cards (A85). */
+
+const BAND = { get high() { return t('High'); }, get medium() { return t('Medium'); }, get low() { return t('Low'); } };
+
+const LOADED = new Intl.DateTimeFormat('en-PH', { timeZone: 'Asia/Manila', hour: 'numeric', minute: '2-digit' });
+
+export function agenciesOf(inc) {
+  const list = (inc.requested_agencies ?? []).map((a) => AGENCY_LABEL[a] ?? a);
+  return list.length ? list.join(' · ') : t('Not stated');
+}
+
+export function confidenceOf(inc) {
+  const band = BAND[inc.confidence_band] ?? '—';
+  return `${band} · ${(inc.confidence_score ?? 0).toFixed(2)}`;
+}
+
+function IncidentCards({
+  incidents, isNew, selectedId, onOpen, loading, emptyMessage, staleAt, yourOrg,
+}) {
+  if (incidents.length === 0) {
+    return loading ? (
+      <div role="status" aria-busy="true">
+        <span className="web-sr-only">{t('Loading incidents…')}</span>
+        <Skeleton shape="table" rows={4} />
+      </div>
+    ) : (
+      <p className="rpl-empty-line">{emptyMessage}</p>
+    );
+  }
+  return (
+    <ul className={`rpl-incident-cards${staleAt ? ' is-stale' : ''}`} aria-busy={loading || undefined}>
+      {incidents.map((inc) => {
+        const unread = isNew(inc);
+        const stats = [
+          [t('Reports'), inc.report_count],
+          [t('Confidence'), confidenceOf(inc)],
+          [staleAt ? t('Last loaded') : t('Updated'), staleAt ? LOADED.format(new Date(staleAt)) : ago(inc.updated_at ?? inc.reported_at)],
+        ];
+        return (
+          <li key={inc.id} className={`rpl-incident-card${unread ? ' is-unread' : ''}${inc.id === selectedId ? ' is-selected' : ''}`}>
+            <span className="rpl-incident-card-chips">
+              <LifecycleChip status={inc.status} />
+              {yourOrg && <StatusChip {...yourOrg(inc)} />}
+            </span>
+            <div className="rpl-cell-resource">
+              <span className="rpl-plate rpl-plate--fire" aria-hidden="true"><Icon name="flame" /></span>
+              <span className="rpl-cell-text">
+                <span className="rpl-cell-title">
+                  {inc.designation}
+                  {unread && <span className="web-sr-only">{t(', new since you last looked')}</span>}
+                </span>
+                <span className="rpl-cell-meta"><Place lat={inc.centroid_lat} lng={inc.centroid_lng} /> · {agenciesOf(inc)}</span>
+              </span>
+            </div>
+            <dl className="rpl-incident-card-stats">
+              {stats.map(([t, v]) => (
+                <div key={t}><dt>{t}</dt><dd>{v}</dd></div>
+              ))}
+            </dl>
+            <button type="button" className="rpl-button rpl-button--secondary" onClick={() => onOpen(inc)}>{t('Open incident')}<span className="web-sr-only"> {inc.designation}</span>
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+export default function IncidentTable({
+  incidents, lastViewed, selectedId, onOpen, loading = false, emptyMessage, staleAt = null,
+  yourOrg = null,
+}) {
+  const stacked = useMedia(RAIL_BELOW);
+  const lastMs = lastViewed ? new Date(lastViewed).getTime() : Infinity;
+  const isNew = (inc) => new Date(inc.reported_at).getTime() > lastMs;
+
+  if (stacked) {
+    return (
+      <IncidentCards
+        incidents={incidents}
+        isNew={isNew}
+        selectedId={selectedId}
+        onOpen={onOpen}
+        loading={loading}
+        emptyMessage={emptyMessage}
+        staleAt={staleAt}
+        yourOrg={yourOrg}
+      />
+    );
+  }
+  const columns = yourOrg ? 8 : 7;
+
+  return (
+    <div className={`web-table-wrap${staleAt ? ' is-stale' : ''}`}>
+      <table className="web-table rpl-incidents" aria-busy={loading || undefined}>
+        <thead>
+          <tr>
+            <th scope="col">{t('Area')}</th>
+            <th scope="col">{t('Status')}</th>
+            <th scope="col">{t('Requested')}</th>
+            <th scope="col">{t('Confidence')}</th>
+            <th scope="col">{t('Reports')}</th>
+            <th scope="col">{t('Updated')}</th>
+            {yourOrg && <th scope="col">{t('Your org')}</th>}
+            <th scope="col"><span className="web-sr-only">{t('Open')}</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {incidents.map((inc) => {
+            const unread = isNew(inc);
+            const selected = inc.id === selectedId;
+            return (
+              <tr
+                key={inc.id}
+                className={`web-table-row${selected ? ' is-selected' : ''}${unread ? ' is-unread' : ''}`}
+              >
+                <th scope="row">
+                  <span className="rpl-cell-area">
+                    <span className={`rpl-unread-dot${unread ? ' is-on' : ''}`} aria-hidden="true" />
+                    <span className="rpl-cell-text">
+                      <span className="rpl-cell-title">
+                        {inc.designation}
+                        {unread && <span className="web-sr-only">{t(', new since you last looked')}</span>}
+                      </span>
+                      <span className="rpl-cell-meta"><Place lat={inc.centroid_lat} lng={inc.centroid_lng} /></span>
+                    </span>
+                  </span>
+                </th>
+                <td><LifecycleChip status={inc.status} /></td>
+                <td>{agenciesOf(inc)}</td>
+                <td>{confidenceOf(inc)}</td>
+                <td className="rpl-cell-strong">{inc.report_count}</td>
+                <td className="rpl-cell-quiet">
+                  {staleAt ? t('Last loaded {time}', { time: LOADED.format(new Date(staleAt)) }) : ago(inc.updated_at ?? inc.reported_at)}
+                </td>
+                {yourOrg && <td><StatusChip {...yourOrg(inc)} /></td>}
+                <td className="web-table-action-cell">
+                  <button
+                    type="button"
+                    className="web-table-row-action"
+                    onClick={() => onOpen(inc)}
+                    aria-current={selected ? 'true' : undefined}
+                  >{t('Open')}<span className="web-sr-only"> {inc.designation}</span>
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
+          {incidents.length === 0 && (
+            <tr>
+              <td className="web-table-empty" colSpan={columns}>
+                {loading ? (
+                  <span role="status">
+                    <span className="web-sr-only">{t('Loading incidents…')}</span>
+                    <Skeleton shape="table" rows={4} />
+                  </span>
+                ) : emptyMessage}
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
