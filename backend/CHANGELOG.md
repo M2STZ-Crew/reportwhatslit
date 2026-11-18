@@ -6,6 +6,84 @@ the mobile app (`replit-android`) carry the same number.
 
 ---
 
+## v1.12.39 — 18 November 2026 — No emoji in any text box; all of Metro Manila on the map
+
+Console, residents' site and docs; app v1.12.50 goes with it. No server
+change, no migration. These were pushed to v1.12.38's branch after it was
+merged, so they come as their own release. Production's map layers were
+loaded on 18 Nov, with approval, and need no deploy.
+
+### Changes
+- **No emoji in any text box** (18 Nov: "make in any characters typing in
+  every typebox in the app and web cannot be typed by any emoji"). One
+  listener on the console (`admin-web/src/lib/noEmoji.js`, installed in
+  `main.jsx`) and one on the residents' site (`account.js`) drop emoji from
+  every input and textarea as they are typed or pasted, before React reads
+  them; the cursor stays put. The same ranges as the app.
+- **Evacuation sites and hydrants: where they came from.** 22 Pasay covered
+  courts and multi-purpose halls (OpenStreetMap, approved 18 Nov: "the marked
+  22 yes") were added to production's evacuation sites, and 17 OpenStreetMap
+  hydrants (approved: "Yes, load them") to its hydrants, each with its
+  `openstreetmap:node/…` source and an unknown status until BFP checks it.
+  `docs/data-sources.md` cites both (APA 7, ODbL), with the review lists in
+  `docs/evacuation-sites/` and `docs/hydrants/`.
+- **All of Metro Manila's hydrants, covered courts, cisterns and bodies of
+  water** (18 Nov: "now, let's get all of the data within metropolitan manila
+  only"; "Only fire tanks + reservoirs"; "Rivers, creeks, ponds, lakes").
+  From OpenStreetMap, production gained 1,254 hydrants (now 1,274), 1,305
+  evacuation sites, all outside Pasay (now 1,328), 11 cisterns (fire water
+  tanks and covered reservoirs) and 448 bodies of water, across the 16 cities
+  and Pateros. A place already there, or within a few metres of one, was
+  skipped. Each keeps its OpenStreetMap reference, and its city comes from the
+  city boundary it falls inside. `docs/data-sources.md` cites each layer (APA
+  7, ODbL) with the queries; the lists are in `docs/metro-manila/`.
+- **The console's maps draw a layer's places from street level in** ("Only
+  nearby, when zoomed in"). On the Live map and in Map settings, shelters,
+  hydrants, cisterns, bodies of water and the risk zones' icons are drawn from
+  zoom 14 in, and only those on or near the screen; further out, "Zoom in to
+  see the places you turned on" (`admin-web/src/map/ZoomGate.jsx`). A risk
+  zone's circle, incidents and units are drawn at every zoom, as on the app.
+  Map settings opens at zoom 14, so its editor starts on the places nearby,
+  and its note sits clear of the editor panel.
+
+---
+
+## v1.12.38 — 18 November 2026 — Confirm your email; every resident hears of a fire; BFP raises the alarm
+
+Backend and console; app v1.12.49 goes with it. No migration.
+
+### Changes
+- **Confirm before use** (18 Nov: "an illegitimate email can still signup
+  (the account was created because of the 'later' button)"). A resident is
+  refused everywhere (403 `email_not_verified`) until the emailed link is
+  opened, but for sign-in, `/auth/me` (now `email_verification_required`), the
+  verification status, and asking for a new link (`POST
+  /verification/email/request` is reachable before confirming). The live
+  socket refuses them too. Staff are not gated. An account made from 19 Nov
+  2026 on that is still unconfirmed 24 hours after sign-up is deleted by the
+  hourly job (`purge_unconfirmed`); older accounts are kept.
+  `REQUIRE_CITIZEN_EMAIL_VERIFICATION`, `UNCONFIRMED_ACCOUNT_HOURS` (24),
+  `UNCONFIRMED_PURGE_SINCE`.
+- **Every resident hears of a verified fire** (18 Nov: "even outside of 100m
+  everyone get notified (but in the 100m can only corroborate)"; "Everyone,
+  once verified"). When staff verify a fire, every resident with RepLiT gets
+  one alert in their language, "Fire verified · Responders verified a fire on
+  {street}…", which opens its details (`fire_verified`). The residents within
+  100 m still get "Do you see it too?" instead, and only they can corroborate;
+  the fire's reporters and frozen accounts are left out. Sent after the verify
+  answers, in batches of 500 (`app/services/fire_broadcast.py`).
+- **BFP raises the alarm directly** (18 Nov: "bfp coordinator can raise an
+  alarm without the request of fv"). `POST /alarm-requests/raise`: a BFP
+  Coordinator (or the BFP Admin) sets a higher level with no request to
+  answer; it is recorded as a request BFP made and answered at once, and
+  waiting Fire Volunteer requests it meets are answered with it.
+- **The fire type for everyone** (18 Nov: "make all of the user aware in the
+  details of the incident"). `GET /areas/{id}` now says what is burning and
+  which team said (never the person); the console's incident drawer shows it
+  as a fact and on the timeline.
+
+---
+
 ## v1.12.37 — 17 November 2026 — Tagalog keeps the nav; Sign out asks first
 
 Console only; app v1.12.47 goes with it. No migration, no server change.
