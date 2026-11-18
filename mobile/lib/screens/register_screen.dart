@@ -16,6 +16,7 @@ import '../store_build.dart';
 import 'role_gate.dart';
 import '../widgets/app_icons.dart';
 import '../i18n/i18n.dart';
+import '../widgets/no_emoji.dart';
 
 /// "03 Sign up" from the REPLIT-OVERHAUL Figma.
 ///
@@ -119,7 +120,24 @@ class _RegisterScreenState extends State<RegisterScreen> {
       if (PhoneNumbers.open) {
         await showPhoneCodeSheet(context, phone: mobile, api: _api);
       } else {
-        await showEmailLinkSheet(context, email: email, api: _api);
+        // Confirm before use (v1.12.49): no Later. "Wrong email? Start
+        // over" signs out, back on this form; the account made with the
+        // wrong address goes by itself a day after sign-up.
+        final confirmed = await showEmailLinkSheet(
+          context,
+          email: email,
+          api: _api,
+          required: true,
+        );
+        if (!confirmed) {
+          try {
+            await _api.logout();
+          } catch (_) {}
+          await Session.instance.clear();
+          if (!mounted) return;
+          _error(t('Signed out. Sign up again with the right email.'));
+          return;
+        }
       }
       if (!mounted) return;
       await Navigator.of(
@@ -173,6 +191,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
             LabeledField(
               label: t('First name'),
               builder: (focus) => TextField(
+                inputFormatters: const [NoEmojiFormatter()],
                 controller: _first,
                 focusNode: focus,
                 textCapitalization: TextCapitalization.words,
@@ -186,6 +205,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
             LabeledField(
               label: t('Last name'),
               builder: (focus) => TextField(
+                inputFormatters: const [NoEmojiFormatter()],
                 controller: _last,
                 focusNode: focus,
                 textCapitalization: TextCapitalization.words,
@@ -199,6 +219,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
             LabeledField(
               label: t('Email address'),
               builder: (focus) => TextField(
+                inputFormatters: const [NoEmojiFormatter()],
                 controller: _email,
                 focusNode: focus,
                 keyboardType: TextInputType.emailAddress,
@@ -221,7 +242,10 @@ class _RegisterScreenState extends State<RegisterScreen> {
                 keyboardType: TextInputType.phone,
                 textInputAction: TextInputAction.next,
                 autofillHints: const [AutofillHints.telephoneNumber],
-                inputFormatters: const [PhMobileFormatter()],
+                inputFormatters: const [
+                  NoEmojiFormatter(),
+                  PhMobileFormatter(),
+                ],
                 style: context.type.input,
                 decoration: const InputDecoration(hintText: kPhMobileHint),
               ),
@@ -237,6 +261,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
             LabeledField(
               label: t('Password'),
               builder: (focus) => TextField(
+                inputFormatters: const [NoEmojiFormatter()],
                 controller: _password,
                 focusNode: focus,
                 obscureText: _obscure,
