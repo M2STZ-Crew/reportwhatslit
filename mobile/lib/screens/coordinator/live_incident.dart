@@ -90,9 +90,7 @@ class LiveTab extends StatelessWidget {
                           icon: AppIcons.localFireDepartment,
                           title: t('No incident is live'),
                           body: t(
-                            'An Area shows here once it is accepted, with '
-                            'the units on their way and on scene. The queue '
-                            'has what is waiting on you.',
+                            'An incident shows here once it is accepted, with the units on their way and on scene. The queue has what is waiting on you.',
                           ),
                         )
                       : const LoadingView(),
@@ -377,21 +375,15 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
             title: t('Mark {name} fire out?', {'name': area.name}),
             body: units.isEmpty
                 ? t(
-                    'Everyone responding stands down and stops sharing '
-                    'location. The Area moves to To file until you submit its '
-                    'post-incident report.',
+                    'Everyone responding stands down and stops sharing location. The incident moves to To file until you submit its post-incident report.',
                   )
                 : units.length == 1
                 ? t(
-                    '{unit} stands down and stops sharing location. The Area '
-                    'moves to To file until you submit its post-incident '
-                    'report.',
+                    '{unit} stands down and stops sharing location. The incident moves to To file until you submit its post-incident report.',
                     {'unit': units.single},
                   )
                 : t(
-                    '{units} stand down and stop sharing location. The Area '
-                    'moves to To file until you submit its post-incident '
-                    'report.',
+                    '{units} stand down and stop sharing location. The incident moves to To file until you submit its post-incident report.',
                     {'units': andList(units)},
                   ),
           ),
@@ -544,14 +536,25 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
       reports = const [];
     }
     if (!mounted) return;
-    final reason = await showFrameSheet<String>(
+    final choice = await showFrameSheet<RejectChoice>(
       context,
       builder: (_) => RejectSheet(area: area, reports: reports),
     );
-    if (reason == null || !mounted) return;
+    if (choice == null || !mounted) return;
     await _act(
-      () => _api.rejectIncident(widget.areaId, reason),
-      t('{name} rejected. It has left the live feed.', {'name': area.name}),
+      () => _api.rejectIncident(
+        widget.areaId,
+        choice.reason,
+        prank: choice.prank,
+        serious: choice.serious,
+      ),
+      choice.prank
+          ? t('{name} rejected as a prank. The reporter gets a strike.', {
+              'name': area.name,
+            })
+          : t('{name} rejected. It has left the live feed.', {
+              'name': area.name,
+            }),
     );
   }
 
@@ -864,7 +867,7 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
                     const SizedBox(height: 12),
                     ListRow(
                       leading: const IconPlate(AppIcons.description),
-                      title: t('Area details'),
+                      title: t('Incident details'),
                       subtitle: t(
                         'Where it is, confidence, summary and reports',
                       ),
@@ -896,7 +899,7 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
                             area.status == 'verified'))
                       Center(
                         child: TextLink(
-                          t('Reject this Area'),
+                          t('Reject this incident'),
                           color: pal.live,
                           onTap: _reject,
                         ),
@@ -904,9 +907,7 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
                     if (!_powers.coordinates)
                       InlineAlert(
                         body: t(
-                          'You follow this Area here, and can get directions to '
-                          'it. Fire Volunteer and BFP coordinators and responders '
-                          'run the response: going, fire out and the report.',
+                          'You follow this incident here, and can get directions to it. Fire Volunteer and BFP coordinators and responders run the response: going, fire out and the report.',
                         ),
                       ),
                   ],
@@ -966,7 +967,7 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
     final String subtitle;
     if (onScene) {
       subtitle = away == null
-          ? t('The Area is marked on scene')
+          ? t('The incident is marked on scene')
           : t('Within {_onSceneMetres} m of the fire', {
               '_onSceneMetres': _onSceneMetres.round(),
             });
