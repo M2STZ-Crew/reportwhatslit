@@ -7,6 +7,66 @@ nothing shows it — the version alone names a release everywhere.
 
 ---
 
+## v1.12.63 — 26 November 2026 — LIVE before I AM GOING; Terms
+
+Goes with backend v1.12.53.
+
+- **An organization not going sees the fire, not its controls** (answered
+  "Info + 2 buttons"). Its LIVE panel shows the status, progress, fire type and
+  Incident details, with I AM GOING and CLOSE. Alarm level, fire codes and Mark
+  fire out appear once it is going; BFP's alarm level shows anyway.
+- **The fire type waits for the first team on scene** and reads so until
+  they fill it in; only a team going may.
+- **No card per unit** in the panel (answered "Remove it"): the title counts
+  them and the map shows them.
+- **Terms** in Profile, and no read-storage permission.
+
+---
+
+## v1.12.62 — 23 November 2026 — Centered where you can see; On route; the fire type before the alarm
+
+Goes with backend v1.12.52.
+
+- **Center and navigation put you where you can see** ("it centers the whole
+  screen but the drawer blocks it"; answered "Visible center"). The map puts
+  you in the middle of the part the drawer leaves in view, or low in it while
+  navigating, and follows as the drawer moves. Where a drawer can cover most
+  of the map, Center first brings it back down. On Track it live, LIVE, the
+  Coordinator and Responder maps, directions and the residents' map.
+- **The fire type comes first** ("before to proceed with positive fire
+  alarm, someone should fill the fire type first"). Until the first fire team
+  on scene says what is burning, the alarm sheet says so instead of offering
+  levels.
+- **On route** replaces "En route" in every text ("change the text en route
+  to on route totally").
+
+---
+
+## v1.12.61 — 23 November 2026 — The percentage circle is back; the alarm level in its place
+
+No backend change.
+
+- **Getting you help keeps its percentage circle** ("don't remove that circle
+  with percentage"; answered "A. Becomes title" and "Only if needed"). The
+  alarm banner of v1.12.60 took the circle's room, on most phones from the
+  moment a fire was acknowledged, and made short ones scroll. While there is
+  an alarm it is now the title, and the steps tighten only where they must:
+  the finished ones fold to a line, then all five share a card. The circle
+  never leaves. The page doesn't scroll at the standard type size; at a large
+  one on the shortest phones it scrolls rather than lose the circle.
+- **Track it live** ("put the alarm level between incident lifecycle and who
+  acknowledge it"; answered "Small badge" and "Only this one"): status, fire
+  type, the stages, the alarm, who acknowledged. Pulled down, the sheet shows
+  the alarm as a badge in the time's place. Every other detail screen keeps
+  the banner at the top.
+- The circle's stage reads in Tagalog, and shows from a 100 dp circle up.
+- **Want to be an affiliate? Register here** opens the Admin console's form at
+  its own address, not through the retired one's redirect.
+- **No microphone or storage permission** (answered "Remove them"): the
+  camera plugin declared both, and RepLiT uses neither.
+
+---
+
 ## v1.12.60 — 22 November 2026 — The alarm status, highlighted, for everyone; Alarm Escalations
 
 Goes with backend v1.12.49.

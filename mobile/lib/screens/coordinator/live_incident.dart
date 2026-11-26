@@ -7,7 +7,6 @@ import 'package:latlong2/latlong.dart';
 
 import '../../api/api_client.dart';
 import '../../api/live_refresh.dart';
-import '../../location/live_position.dart';
 import '../../location/responder_tracker.dart';
 import '../../models/alarm.dart';
 import '../../models/area_view.dart';
@@ -25,6 +24,7 @@ import '../../widgets/map_tiles.dart';
 import '../../widgets/sheet_grip.dart';
 import '../../widgets/staff_shell.dart' show StaffAccount;
 import '../../widgets/you_are_here.dart';
+import 'coordinator_shell.dart';
 import '../bfp/bfp_alarm_requests_screen.dart';
 import '../responder/responder_status.dart';
 import '../subadmin/post_incident_report_screen.dart';
@@ -37,9 +37,6 @@ import '../../widgets/responsive_frame.dart';
 import '../../models/alarm_status.dart';
 import '../../widgets/alarm_status_banner.dart';
 import '../../widgets/withdraw_control_sheet.dart';
-
-/// A unit within this distance of the Area's centre is on scene.
-const double _onSceneMetres = 100;
 
 /// How much of the screen LIVE's sheet covers when it opens.
 const double _sheetStart = 0.62;
@@ -170,7 +167,21 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
   late final LiveRefresh _live = LiveRefresh([
     incidentChannel(widget.areaId),
   ], _load);
-  final MapFollow _follow = MapFollow();
+  late final MapFollow _follow = MapFollow()..makeRoom = _makeRoom;
+  final ValueNotifier<double> _cover = ValueNotifier(0);
+
+  /// Center (v1.12.62): a drawer pulled up over most of the map comes back
+  /// to where it opens first, so there is room to show where you are.
+  void _makeRoom() {
+    if (_sheetSize.isAttached && _sheetSize.size > 0.7) {
+      _sheetSize.animateTo(
+        _sheetStart,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOutCubic,
+      );
+    }
+  }
+
   final ResponderTracker _tracker = ResponderTracker.instance;
 
   /// The details sheet, so its frozen grip can drag it.
@@ -204,6 +215,25 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
     return null;
   }
 
+  /// This coordinator, or anyone of their organization, is going or on scene
+  /// (v1.12.63; 26 Nov 2026: answered "Info + 2 buttons"). Until then the
+  /// panel offers I AM GOING and CLOSE, and nothing that acts on the fire.
+  bool get _orgGoing {
+    final org = widget.me['primary_org_id'] as String?;
+    for (final d in _dispatches) {
+      if (d['status'] != 'active') continue;
+      if (d['responder_id'] == _myId) return true;
+      if (org != null && d['organization_id'] == org) return true;
+    }
+    return false;
+  }
+
+  /// Not this organization's fire after all: back to the Queue.
+  void _close() {
+    final nav = Navigator.of(context);
+    if (!CoordinatorShell.showQueue(nav)) nav.maybePop();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -230,6 +260,7 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
     _poll?.cancel();
     unawaited(_live.dispose());
     _follow.dispose();
+    _cover.dispose();
     _sheetSize.dispose();
     super.dispose();
   }
@@ -704,7 +735,8 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
           initialChildSize: _sheetStart,
           minChildSize: _sheetMin,
           maxChildSize: _sheetMax,
-          builder: (context, scroll) => _sheet(area, units, scroll),
+          builder: (context, scroll) =>
+              MapCover(cover: _cover, child: _sheet(area, units, scroll)),
         ),
       ],
     );
@@ -774,7 +806,7 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
             ),
           ],
         ),
-        YouAreHereLayer(follow: _follow),
+        YouAreHereLayer(follow: _follow, cover: _cover),
         MapLocationButtons(
           follow: _follow,
           alignment: Alignment.topRight,
@@ -891,50 +923,56 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
                         area: area,
                         onPick:
                             _powers.responds &&
+                                _orgGoing &&
                                 area.mayAnswerFireType(StaffAccount.current)
                             ? _pickFireType
                             : null,
                       ),
                       const SizedBox(height: 12),
                     ],
-                    for (final u in units) ...[
-                      _unitRow(u, area),
+                    // Alarm level and fire codes act on the fire: an
+                    // organization that is not going sees them once it is.
+                    // BFP raises the alarm from anywhere.
+                    if (!_powers.responds ||
+                        _orgGoing ||
+                        _powers.decidesAlarm) ...[
+                      ListRow(
+                        // Red while a request waits: on BFP to answer, or on BFP
+                        // for the coordinator who asked.
+                        leading: IconPlate(
+                          AppIcons.warning,
+                          tint: _asks.any((r) => r.waiting) ? pal.live : null,
+                        ),
+                        title: t('Alarm level'),
+                        subtitle: _alarmLine(area),
+                        trailing: RowValue(alarmWord(area.alarmLevel)),
+                        chevron: _powers.requestsAlarm || _powers.decidesAlarm,
+                        onTap:
+                            _busy ||
+                                !(_powers.requestsAlarm || _powers.decidesAlarm)
+                            ? null
+                            : _alarm,
+                      ),
                       const SizedBox(height: 12),
                     ],
-                    ListRow(
-                      // Red while a request waits: on BFP to answer, or on BFP
-                      // for the coordinator who asked.
-                      leading: IconPlate(
-                        AppIcons.warning,
-                        tint: _asks.any((r) => r.waiting) ? pal.live : null,
+                    if (!_powers.responds || _orgGoing) ...[
+                      // The fire codes, for this incident only (v1.12.56: they
+                      // were a tab of their own, tied to whichever fire LIVE
+                      // showed).
+                      ListRow(
+                        leading: const IconPlate(AppIcons.gridView),
+                        title: t('Fire codes'),
+                        // The latest press, when there is one (v1.12.58).
+                        subtitle: area.fireCodes.isNotEmpty
+                            ? codeLine(area.fireCodes.first)
+                            : _powers.pressesCodes
+                            ? t('Press one to record it on this incident')
+                            : t('What each code means'),
+                        chevron: true,
+                        onTap: _codes,
                       ),
-                      title: t('Alarm level'),
-                      subtitle: _alarmLine(area),
-                      trailing: RowValue(alarmWord(area.alarmLevel)),
-                      chevron: _powers.requestsAlarm || _powers.decidesAlarm,
-                      onTap:
-                          _busy ||
-                              !(_powers.requestsAlarm || _powers.decidesAlarm)
-                          ? null
-                          : _alarm,
-                    ),
-                    const SizedBox(height: 12),
-                    // The fire codes, for this incident only (v1.12.56: they
-                    // were a tab of their own, tied to whichever fire LIVE
-                    // showed).
-                    ListRow(
-                      leading: const IconPlate(AppIcons.gridView),
-                      title: t('Fire codes'),
-                      // The latest press, when there is one (v1.12.58).
-                      subtitle: area.fireCodes.isNotEmpty
-                          ? codeLine(area.fireCodes.first)
-                          : _powers.pressesCodes
-                          ? t('Press one to record it on this incident')
-                          : t('What each code means'),
-                      chevron: true,
-                      onTap: _codes,
-                    ),
-                    const SizedBox(height: 12),
+                      const SizedBox(height: 12),
+                    ],
                     ListRow(
                       leading: const IconPlate(AppIcons.description),
                       title: t('Incident details'),
@@ -958,7 +996,7 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
                       ),
                       const SizedBox(height: 10),
                     ],
-                    if (_powers.marksFireOut)
+                    if (_powers.marksFireOut && _orgGoing)
                       AppButton.secondary(
                         t('Mark fire out'),
                         busy: _busy,
@@ -1000,6 +1038,10 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
           onPressed: _busy ? null : _go,
         ),
         const SizedBox(height: 10),
+        if (!_orgGoing) ...[
+          AppButton.secondary(t('Close'), onPressed: _busy ? null : _close),
+          const SizedBox(height: 10),
+        ],
       ];
     }
     return [
@@ -1019,52 +1061,6 @@ class _LiveIncidentViewState extends State<LiveIncidentView> {
       ),
       const SizedBox(height: 10),
     ];
-  }
-
-  Widget _unitRow(_Unit u, AreaView area) {
-    final pal = context.pal;
-    final centre = area.centre!;
-    final at = u.at;
-    final away = at == null ? null : metresBetween(at, centre);
-    final onScene =
-        (away != null && away <= _onSceneMetres) ||
-        (at == null && area.status == 'arrived');
-    final fixAt = parseTime(u.fix?['captured_at']);
-    final stale =
-        fixAt != null && DateTime.now().difference(fixAt).inSeconds > 30;
-    final moving = ((u.fix?['speed_mps'] as num?)?.toDouble() ?? 0) > 1;
-    final crew = u.crew.length;
-    final String subtitle;
-    if (onScene) {
-      subtitle = away == null
-          ? t('The incident is marked on scene')
-          : t('Within {_onSceneMetres} m of the fire', {
-              '_onSceneMetres': _onSceneMetres.round(),
-            });
-    } else if (away == null) {
-      subtitle = t('No location yet');
-    } else {
-      subtitle = [
-        t('{formatDistance} away', {'formatDistance': formatDistance(away)}),
-        if (stale)
-          t('last seen {agoText}', {'agoText': agoText(fixAt)})
-        else if (moving)
-          'moving',
-        if (!stale) t('updates every 5 s'),
-      ].join(' · ');
-    }
-    final tone = onScene ? pal.ok : (away == null ? pal.label : pal.info);
-    return ListRow(
-      leading: IconPlate(
-        AppIcons.fireTruck,
-        tint: away == null && !onScene ? null : tone,
-      ),
-      title: crew > 1
-          ? t('{name} · {crew} crew', {'name': u.name, 'crew': crew})
-          : u.name,
-      subtitle: subtitle,
-      trailing: RowValue(onScene ? t('On scene') : t('En route'), color: tone),
-    );
   }
 }
 
