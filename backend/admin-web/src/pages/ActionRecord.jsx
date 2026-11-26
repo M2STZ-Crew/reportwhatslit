@@ -4,7 +4,7 @@ import { api } from '../api/client.js';
 import { agencyLabel } from '../auth.jsx';
 import { useConsole } from '../components/ConsoleShell.jsx';
 import {
-  EmptyState, Icon, PageHeader, Pager, StatePanel, usePager,
+  EmptyState, Icon, PageHeader, Pager, Select, StatePanel, usePager,
 } from '../components/ui/index.js';
 import { t } from '../i18n/i18n.jsx';
 import { fireName } from '../lib/place.js';
@@ -47,6 +47,7 @@ const CATEGORY = {
   get user() { return t('Account'); },
   get report() { return t('Report'); },
   get dispatch() { return t('Dispatch'); },
+  get affiliate() { return t('Affiliation'); },
 };
 const categoryOf = (action = '') => CATEGORY[action.split('.')[0]] ?? t('Other');
 
@@ -57,6 +58,19 @@ const VERB = {
   get 'incident.post_incident_report'() { return t('Filed post-incident report'); },
   get 'incident.under_control'() { return t('Declared under control'); },
   get 'incident.under_control_withdrawn'() { return t('Withdrew Under control'); },
+  get 'affiliate.accept'() { return t('Accepted an affiliate'); },
+  get 'affiliate.decline'() { return t('Declined an affiliate'); },
+  get 'affiliate.suspend'() { return t('Suspended an affiliate'); },
+  get 'affiliate.revoke'() { return t('Revoked an affiliate'); },
+  get 'affiliate.restore'() { return t('Restored an affiliate'); },
+  get 'affiliate.delete'() { return t('Deleted an affiliate'); },
+  get 'user.coordinator_created'() { return t('Created a Coordinator account'); },
+  get 'user.coordinator_updated'() { return t('Edited a Coordinator account'); },
+  get 'user.coordinator_moved'() { return t('Moved a Coordinator'); },
+  get 'user.coordinator_email_set'() { return t('Set a Coordinator’s email'); },
+  get 'user.coordinator_password_link'() { return t('Sent a Coordinator a password link'); },
+  get 'user.coordinator_deactivated'() { return t('Turned off a Coordinator account'); },
+  get 'user.coordinator_reactivated'() { return t('Turned on a Coordinator account'); },
   get 'user.responder_created'() { return t('Created a Responder account'); },
   get 'user.responder_updated'() { return t('Edited a Responder account'); },
   get 'user.responder_moved'() { return t('Moved a Responder'); },
@@ -86,11 +100,15 @@ function detailOf(r) {
       .map((x) => `${agencyLabel(x.agency)}${x.organization_name ? ` (${x.organization_name})` : ''}`)
       .join(', ');
   }
+  if (r.action?.startsWith('affiliate.') && r.metadata?.organization) {
+    return [r.metadata.organization, r.metadata.notes ?? r.metadata.note].filter(Boolean).join(' · ');
+  }
   if (r.metadata?.notes) return r.metadata.notes;
-  if (r.metadata?.responder) {
+  const account = r.metadata?.responder ?? r.metadata?.coordinator;
+  if (account) {
     const changed = (r.metadata.changed ?? []).map((key) => FIELD[key] ?? key).join(', ');
     const to = r.metadata.moved_to ? t('to {org}', { org: r.metadata.moved_to }) : null;
-    return [r.metadata.responder, to, changed].filter(Boolean).join(' · ');
+    return [account, to, changed].filter(Boolean).join(' · ');
   }
   return null;
 }
@@ -172,8 +190,8 @@ function Timeline({ group, matched }) {
     <li className="rpl-audit-more">
       <button type="button" className="rpl-text-button" onClick={() => setAll(true)}>
         {group.newestFirst
-          ? t('Show {count} older entries', { count: hidden })
-          : t('Show {count} earlier entries', { count: hidden })}
+          ? (hidden === 1 ? t('Show {count} older entry', { count: hidden }) : t('Show {count} older entries', { count: hidden }))
+          : (hidden === 1 ? t('Show {count} earlier entry', { count: hidden }) : t('Show {count} earlier entries', { count: hidden }))}
       </button>
     </li>
   );
@@ -219,7 +237,9 @@ function Group({ group, matched, open, onToggle, onOpenIncident }) {
           <span className="rpl-cell-text">
             <span className="rpl-cell-title">{group.name}</span>
             <span className="rpl-cell-meta">
-              {t('{count} entries · latest {when}', { count: matched.length, when: timeOf(last.created_at) })}
+              {matched.length === 1
+                ? t('{count} entry · latest {when}', { count: matched.length, when: timeOf(last.created_at) })
+                : t('{count} entries · latest {when}', { count: matched.length, when: timeOf(last.created_at) })}
               {' · '}
               {labelOf(last.action)}
             </span>
@@ -308,19 +328,18 @@ export default function ActionRecord({ onOpenIncident }) {
 
       <div className="rpl-filters">
         <SearchBox label={t('Search the audit log')} placeholder={t('Search actions, incidents, agencies')} value={query} onChange={setQuery} />
-        <label className="rpl-select">
-          <span className="rpl-select-label">{t('Action')}</span>
-          <select value={category} onChange={(e) => setCategory(e.target.value)}>
-            <option value="all">{t('All actions')}</option>
-            {categories.map((c) => <option key={c} value={c}>{c}</option>)}
-          </select>
-        </label>
-        <label className="rpl-select">
-          <span className="rpl-select-label">{t('Sort')}</span>
-          <select value={sort} onChange={(e) => setSort(e.target.value)}>
-            {Object.entries(SORTS).map(([key, s]) => <option key={key} value={key}>{s.label}</option>)}
-          </select>
-        </label>
+        <Select
+          label={t('Action')}
+          value={category}
+          onChange={setCategory}
+          options={[{ key: 'all', label: t('All actions') }, ...categories.map((c) => ({ key: c, label: c }))]}
+        />
+        <Select
+          label={t('Sort')}
+          value={sort}
+          onChange={setSort}
+          options={Object.entries(SORTS).map(([key, s]) => ({ key, label: s.label }))}
+        />
       </div>
 
       {phase === 'loading' ? (
@@ -332,7 +351,11 @@ export default function ActionRecord({ onOpenIncident }) {
       ) : (
         <>
           <p className="rpl-table-foot">
-            {t('The latest {count} entries, in {groups} groups.', { count: rows.length, groups: groups.length })}
+            {rows.length === 1
+              ? t('The latest entry, in 1 group.')
+              : groups.length === 1
+                ? t('The latest {count} entries, in 1 group.', { count: rows.length })
+                : t('The latest {count} entries, in {groups} groups.', { count: rows.length, groups: groups.length })}
           </p>
           {matching.length === 0 ? (
             <p className="rpl-empty-line">{t('No entries match these filters.')}</p>

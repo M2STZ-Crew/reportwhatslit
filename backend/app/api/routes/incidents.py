@@ -28,15 +28,16 @@ The matching *_at timestamp is stamped by a database trigger on each status chan
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Query, Request
 
-from app.api.deps import DatabaseDep, StaffUser, StorageClientDep
+from app.api.deps import AdminUser, DatabaseDep, StaffUser, StorageClientDep
 from app.core.config import get_settings
 from app.core.exceptions import (
+    BadRequestError,
     ConflictError,
     ExternalServiceError,
     ForbiddenError,
@@ -60,12 +61,14 @@ from app.schemas.incident import (
     ResponderLocationItem,
     SelfDispatchRequest,
 )
+from app.schemas.statistics import IncidentStatistics, StatisticsScope
 from app.services import alarm_status, fire_broadcast, report_strikes
 from app.services.access import ACKNOWLEDGE, acting_agency, admin_access
 from app.services.acknowledge import insert_acceptance
 from app.services.audit import record_audit
 from app.services.fire_type import (
     ON_SCENE_STATUSES,
+    assert_first_on_scene,
     assert_may_answer,
     validate_fire_type,
 )
@@ -76,6 +79,7 @@ from app.services.incident import (
     assert_can_respond,
     assert_can_verify,
     assert_coordinator,
+    assert_org_going,
     assert_transition,
     can_respond,
     is_coordinator,
@@ -85,6 +89,7 @@ from app.services.incident import (
 from app.services.incident_notify import (
     notify_incident_reporters,
 )
+from app.services.incident_statistics import PERIODS, incident_statistics
 from app.services.map_feed import publish_area_change
 from app.services.pir_queue import pir_progress
 from app.services.tracking import gps_arrival_distance, publish_tracking
@@ -537,6 +542,27 @@ async def incident_stats(user: StaffUser, db: DatabaseDep) -> IncidentStats:
 
 
 @router.get(
+    "/statistics",
+    response_model=IncidentStatistics,
+    summary="The Admin Dashboard's statistics",
+)
+async def get_incident_statistics(
+    admin: AdminUser,
+    db: DatabaseDep,
+    days: Annotated[int, Query()] = 30,
+    scope: Annotated[StatisticsScope | None, Query()] = None,
+) -> IncidentStatistics:
+    """7, 30 or 90 days of fires against the period before (v1.12.50).
+
+    An organization's Admin reads its own unless it asks for ``all``; the
+    central hub and the system Admin always all.
+    """
+    if days not in PERIODS:
+        raise BadRequestError("Choose 7, 30 or 90 days.", details={"field": "days"})
+    return await incident_statistics(db, admin, days, scope)
+
+
+@router.get(
     "/{incident_id}",
     response_model=IncidentDetail,
     summary="Get one incident with its reports",
@@ -761,6 +787,7 @@ async def resolve_incident(
     assert_coordinator(user, "mark incidents fire out")
     current = await _load_status(db, incident_id)
     await _assert_visible(db, incident_id, user)
+    await assert_org_going(db, incident_id, user, "mark it fire out")
     assert_transition(current, "fire_out")
     assert_transition("fire_out", "post_incident_report")
     async with db.acquire() as conn, conn.transaction():
@@ -1225,6 +1252,31 @@ async def set_fire_type(
                 answered_by_org=answered["org_id"],
                 answered_by_name=answered["org_name"],
             )
+        else:
+            # Who arrived first: whoever moved the Area to On scene (v1.12.52).
+            first = await conn.fetchrow(
+                """
+                select u.primary_org_id as org_id, u.agency_type::text as agency,
+                       o.name as org_name, a.arrived_at, now() as now
+                  from public.audit_logs l
+                  join public.users u on u.id = l.actor_user_id
+                  left join public.organizations o on o.id = u.primary_org_id
+                  join public.areas a on a.id = l.area_id
+                 where l.area_id = $1 and l.action = 'incident.arrived'
+                 order by l.created_at
+                 limit 1
+                """,
+                incident_id,
+            )
+            if first is not None:
+                assert_first_on_scene(
+                    org_id=user.primary_org_id,
+                    first_org=first["org_id"],
+                    first_org_name=first["org_name"],
+                    first_agency=first["agency"],
+                    arrived_at=first["arrived_at"],
+                    now=first["now"],
+                )
         await conn.execute(
             """
             update public.areas

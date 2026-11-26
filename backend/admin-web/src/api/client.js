@@ -11,6 +11,11 @@ import { t as tr } from '../i18n/i18n.jsx';
 const BASE = (import.meta.env.VITE_API_BASE || 'http://localhost:8000').replace(/\/+$/, '');
 const TOKEN_KEY = 'replit_admin_token';
 
+/// The server's live channel (v1.12.53; live/socket.js).
+export function liveSocketUrl(token) {
+  return `${BASE.replace(/^http/, 'ws')}/ws?token=${encodeURIComponent(token)}`;
+}
+
 export function getToken() {
   return localStorage.getItem(TOKEN_KEY);
 }
@@ -158,12 +163,37 @@ export const api = {
   // "Forgot password?": the server emails a reset link and answers the same
   // way whether or not the address has an account.
   recover: (email) => request('/auth/recover', { method: 'POST', auth: false, body: { email } }),
+  // The SEC certificate, right after the form (v1.12.53): no account, the
+  // application's own one-hour token.
+  uploadAffiliateCertificate: async (id, token, file) => {
+    const body = new FormData();
+    body.append('token', token);
+    body.append('file', file);
+    const resp = await fetch(`${BASE}/affiliates/register/${id}/certificate`, { method: 'POST', body });
+    let data = {};
+    try { data = await resp.json(); } catch { /* not JSON */ }
+    if (!resp.ok) throw new ApiError(data.message || tr('The certificate could not be uploaded.'), resp.status, data.error ?? null);
+    return data;
+  },
+  affiliateCertificate: (id) => request(`/affiliates/${id}/certificate`),
+  // An accepted organization sets up its Admin (v1.12.53).
+  adminRegistration: (token) =>
+    request(`/affiliates/admin-registration?token=${encodeURIComponent(token)}`, { auth: false }),
+  adminRegistrationCheck: (token, prefix) => request(
+    `/affiliates/admin-registration/check?token=${encodeURIComponent(token)}&prefix=${encodeURIComponent(prefix)}`,
+    { auth: false },
+  ),
+  adminRegistrationCreate: (token, prefix) =>
+    request('/affiliates/admin-registration', { method: 'POST', auth: false, body: { token, prefix } }),
   // Public affiliate registration (no account required).
   registerAffiliate: (payload) =>
     request('/affiliates/register', { method: 'POST', auth: false, body: payload }),
 
   // Dashboard data (admin = staff, sees everything).
   incidentStats: () => request('/incidents/stats'),
+  // The Dashboard's Statistics (v1.12.50): 7, 30 or 90 days; 'org' or 'all'.
+  incidentStatistics: ({ days, scope }) =>
+    request(`/incidents/statistics?${new URLSearchParams({ days: String(days), scope }).toString()}`),
   incidents: (opts = {}) => {
     const q = new URLSearchParams();
     if (opts.activeOnly === false) q.set('active_only', 'false');
@@ -262,8 +292,16 @@ export const api = {
   // Affiliate organization review (admin).
   affiliates: (statusFilter) =>
     request(`/affiliates${statusFilter ? `?status=${encodeURIComponent(statusFilter)}` : ''}`),
-  affiliateAccept: (id, notes) =>
-    request(`/affiliates/${id}/accept`, { method: 'POST', body: { notes: notes || null } }),
+  // With the first Coordinator's name: their sign-in is made from it (v1.12.51).
+  affiliateAccept: (id, { notes, firstName, lastName } = {}) =>
+    request(`/affiliates/${id}/accept`, {
+      method: 'POST',
+      body: {
+        notes: notes || null,
+        coordinator_first_name: firstName || null,
+        coordinator_last_name: lastName || null,
+      },
+    }),
   affiliateReject: (id, notes) =>
     request(`/affiliates/${id}/reject`, { method: 'POST', body: { notes: notes || null } }),
 
@@ -288,11 +326,12 @@ export const api = {
     request(`/alarm-requests/${id}/cancel`, { method: 'POST', body: { notes: notes || null } }),
   alarmRequestDelete: (id) => request(`/alarm-requests/${id}`, { method: 'DELETE' }),
 
-  // An Admin's Coordinator accounts (A48, A49): created for its own
-  // organisation and turned off and on. The sign-in address is made from the
-  // name (obryan.fircor@replit.com); the link to set a password goes to their
+  // An Admin's Coordinator accounts (A48, A49), managed like its Responders'
+  // since v1.12.51. The sign-in address is made from the name
+  // (obryan.fircor@replit.com); the link to set a password goes to their
   // personal email.
-  createCoordinator: ({ firstName, lastName, personalEmail, title, organizationId }) =>
+  adminCoordinators: () => request('/admin/coordinators'),
+  createCoordinator: ({ firstName, lastName, personalEmail, title, mobile, organizationId }) =>
     request('/admin/coordinators', {
       method: 'POST',
       body: {
@@ -300,6 +339,7 @@ export const api = {
         last_name: lastName,
         personal_email: personalEmail,
         title: title || null,
+        mobile: mobile || null,
         ...(organizationId ? { organization_id: organizationId } : {}),
       },
     }),
@@ -308,6 +348,10 @@ export const api = {
     if (organizationId) q.set('organization_id', organizationId);
     return request(`/admin/coordinators/email-preview?${q.toString()}`);
   },
+  updateCoordinator: (id, changes) => request(`/admin/coordinators/${id}`, { method: 'PATCH', body: changes }),
+  coordinatorPasswordLink: (id, personalEmail) => request(`/admin/coordinators/${id}/password-link`, {
+    method: 'POST', body: personalEmail ? { personal_email: personalEmail } : {},
+  }),
   deactivateCoordinator: (id) => request(`/admin/coordinators/${id}/deactivate`, { method: 'POST' }),
   reactivateCoordinator: (id) => request(`/admin/coordinators/${id}/reactivate`, { method: 'POST' }),
 

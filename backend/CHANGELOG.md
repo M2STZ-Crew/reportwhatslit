@@ -6,6 +6,154 @@ the mobile app (`replit-android`) carry the same number.
 
 ---
 
+## v1.12.53 — 26 November 2026 — Only those going act; only BFP sets alarms; live console; affiliation finished
+
+Backend, console and the residents' site. Goes with app v1.12.63. Four
+migrations, applied after the merge with the owner's OK (26 Nov):
+`20261123120000` (v1.12.52's), `20261126090000`, `20261126090100`,
+`20261126090200`.
+
+- **Only an organization going acts on a fire** ("the org can't mark fire out
+  an incident if they're not going on that incident"; answered "Same rule").
+  Fire out, fire codes and alarm requests need the organization to be going
+  or on scene (409 `not_going`), in the app and the console alike. BFP raises
+  the alarm from anywhere.
+- **Only BFP sets alarm levels** ("central hub shouldn't raise an alarm";
+  answered "Ask BFP, like FV"). The central hub asks BFP, like a Fire
+  Volunteer, and no longer raises or approves; the database agrees once
+  `20261126090000` is applied.
+- **The console hears changes within a second** ("the web isn't fast";
+  answered "Live, within a second"). It listens on the server's live channel
+  and reads again what it shows; its 12-second check stays as a fallback.
+- **Open incident** on an alarm escalation, instead of the whole address.
+- **The SEC certificate is really uploaded** (answered "Real private
+  upload"), to a private bucket only the central hub opens.
+- **A declined applicant is told**, without the reason.
+- **An accepted organization sets up its own Admin** (answered "One-time
+  Admin link"): a link valid 48 hours, once, to `/admin-registration`.
+- **Accounts and organizations change only through the server** (answered
+  "Tighten"): the database's direct-write policies go.
+- **Terms** on the residents' site, and the privacy page's contact email.
+- The hub is warned before accepting a second BFP or police organization.
+
+---
+
+## v1.12.52 — 23 November 2026 — The fire type before the alarm; On route
+
+Backend and console. Goes with app v1.12.62. One migration, written and not
+yet applied: `20261123120000_positive_alarm_after_fire_type.sql`.
+
+- **No alarm before the fire type** ("they can't raise an alarm level if
+  someone isn't fill-up the fire type first"; "before to proceed with
+  positive fire alarm, someone should fill the fire type first"). Asking for,
+  raising and approving an alarm level are refused (409 `fire_type_first`)
+  until somebody on scene says what is burning. With the migration applied,
+  Positive Fire Alarm is set when the fire type is first given, instead of at
+  the first verify, and the database refuses any level before it.
+- **The first team on scene says what is burning** ("the first one who can
+  fill-up the fire type is the one who comes the incident first"). Another
+  team gets a 409 `first_on_scene_answers` for 5 minutes after the first
+  arrival; then any fire team on scene can, so an alarm never waits on one
+  phone.
+- **On route** replaces "En route" in every text the console shows.
+
+---
+
+## v1.12.51 — 23 November 2026 — Coordinators managed like Responders; affiliation, checked end to end
+
+Backend and console. No migration. The app is unchanged (its 1.12.61 only
+corrects the affiliate link).
+
+### Security
+- **Accepting an affiliate always makes a new Coordinator account**, with a
+  made @replit.com sign-in, and emails the contact a link that confirms the
+  address and sets the password, as for every Coordinator since 6 November.
+  An account that exists is left as it is.
+- **A suspended or revoked organization is frozen on the socket and in
+  alerts too.** Its open connections close, new ones are refused, and new
+  fire, routing, alarm, fire code and reminder pushes skip its people.
+- An organization is not deleted while an account is still in it.
+
+### Changes
+- **Coordinators are managed like Responders** ("please make the account
+  management in coordinator and responder the same. they can do all those
+  managing things in coordinator and responder too that send that link and
+  things"; answered "Admin console only"). In Accounts an Admin edits name,
+  title and mobile, sends a password link, turns off and on, and sees who is
+  on a fire; the central hub also moves one within an agency. One service,
+  `app/services/staff_admin.py`, holds both kinds' rules.
+- New: `GET /admin/coordinators`, `PATCH /admin/coordinators/{id}`,
+  `POST /admin/coordinators/{id}/password-link`.
+
+### Affiliation ("check the whole affiliation thing")
+- Accepting is one transaction: of two Accepts at once, one organization.
+- The address reaches the organization. The form asks the contact person's
+  name, which becomes the Coordinator's; it was the organization's name. The
+  hub can correct it as it accepts.
+- Accept and decline are in the audit log, which names every affiliate and
+  Coordinator act.
+- The hub sees who and what was listed, and is warned of a name already on
+  the network.
+- The form says what it does: no email promised on a decline, and only the
+  certificate file's name is sent, which it never said.
+- The public form refuses @replit.com and undeliverable contact addresses,
+  takes bounded lists and one-line text (a line break in a name broke the
+  approval email's subject), and its acknowledgements stop at 30 an hour.
+- **Forgot password?** A staff member's personal email no longer swallows
+  the reset of the account that signs in with that same address.
+- Emails' logo comes from the console's current address, and a welcome says
+  where to get the app.
+
+---
+
+## v1.12.50 — 23 November 2026 — The Admin console: frame, Statistics, one Map settings, polish
+
+Backend and console; the app is unchanged. The last of three releases for the
+22 Nov list (ADMIN-ISSUES.md). No migration.
+
+### Changes
+- **Header** ("Palitan nalang to ng Settings Button"; answered "Quick menu +
+  mute warning"). One gear with quick settings. It shows a red dot and Sound
+  off while the alarm cannot be heard.
+- **Sidebar** ("Lagyan ng Sidebar Toggle"; answered "In the sidebar"). It
+  collapses to icons with tooltips and counts, at any desktop width, and is
+  remembered by the browser. Settings is the size of every other item, and it
+  and the account stay in view.
+- **Dashboard** (answered "All incident tables", "Active + to acknowledge"
+  and "Statistics dashboard"). The Incidents card is the active fires routed
+  to the Admin and how many still need acknowledging. No incident tables.
+  Statistics replaces Response measures (`GET /incidents/statistics`,
+  `app/services/incident_statistics.py`): four measures against the period
+  before, fires per day, top barangays, alarm levels and fire types, over 7,
+  30 or 90 days, for the Admin's organization or all. Days before the records
+  began read No records, never zero.
+- **Incidents** (answered "Same rule as the card" and "Custom, every page").
+  No Agency filter. To acknowledge lists what the Admin's organization hasn't
+  acknowledged. Every filter and console form uses one dropdown, for keyboard,
+  screen readers and touch, with counts on its options.
+- **Water resources is in Map settings** (answered "All open, same rights"
+  and "Into the side list"). Map and Water requests tabs. The side list has
+  search, a status filter, status in color and the last check with who. What
+  each Admin may change is as before.
+- **Polish on every page** ("Gawing smooth and premium"; answered "Polish
+  current design"). One hover, press and focus, 150-250 ms, stopped under
+  reduced motion; skeletons in the shape of what is coming; one alignment and
+  type; text readable on both grounds; 44 px targets on touch screens.
+
+### Fixed
+- The alarm escalation form cleared itself at every poll.
+- Organization said "No organization on this account" while it loaded, or
+  when it could not load.
+- The incidents table hid Open at 1280 and 1366 px.
+- Several ringing fires covered the map, and the last one's Open could not
+  be reached. Over a map they now scroll among themselves.
+- The live map showed no places, and no word, while they loaded or failed to.
+- On the light ground the CIAR's selected part could not be read.
+- The audit log said "1 entries". The organization's details called a
+  Coordinator Sub-Admin.
+
+---
+
 ## v1.12.49 — 22 November 2026 — The alarm status everywhere; Admins manage responders; Alarm Escalations
 
 Backend and console; app v1.12.60 goes with it. The second of three releases

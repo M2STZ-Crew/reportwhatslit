@@ -2,7 +2,7 @@ import { useState } from 'react';
 
 import { api } from '../../api/client.js';
 import { PERM, acknowledgedByUs, actsOn, can, routedWord } from '../../lib/access.js';
-import { AGENCY_LABEL, OFF_FEED, alarmLabel, statusOf } from '../../lib/status.js';
+import { AGENCY_LABEL, FIRE_TYPE, OFF_FEED, alarmLabel, statusOf } from '../../lib/status.js';
 import { nextStep, stepText } from '../../lib/strikes.js';
 import Place from '../Place.jsx';
 import { ConfirmDialog, StatusChip } from '../ui/index.js';
@@ -66,7 +66,7 @@ function timelineOf(d, evidence) {
     a.user_name || null,
     'neutral',
   ));
-  push(d.en_route_at, t('A unit set off'), t('The incident went En route'), 'live');
+  push(d.en_route_at, t('A unit set off'), t('The incident went On route'), 'live');
   push(d.arrived_at, t('Arrived on scene'), t('The first unit reached the fire'), 'live');
   // Who set it: a Positive fire alarm is the first verifier's, not BFP's.
   push(
@@ -89,14 +89,6 @@ function timelineOf(d, evidence) {
 /* What is burning, as the first fire team on scene said (v1.12.37, 18 Nov
  * 2026: "make all of the user aware in the details of the incident"). The
  * values are the server's (app/services/fire_type.py). */
-const FIRE_TYPE = {
-  get structural() { return t('Structural'); },
-  get electrical() { return t('Electrical'); },
-  get vehicular() { return t('Vehicular'); },
-  get rubbish() { return t('Rubbish'); },
-  get grass() { return t('Grass'); },
-  get chemical() { return t('Chemical'); },
-};
 const FIRE_SUBTYPE = {
   get residential() { return t('Residential'); },
   get commercial() { return t('Commercial'); },
@@ -229,7 +221,7 @@ function Decision({ d, access, orgName, onAcknowledge, busy, acknowledgedNow }) 
                 ? (who ? t('Acknowledged for {org} by {name}', { org: orgName, name: who }) : t('Acknowledged for {org}', { org: orgName }))
                 : (who ? t('Acknowledged by {name}', { name: who }) : t('Acknowledged'))} · {clock(at)}
             </p>
-            <p className="rpl-success-body">{t('Coordinators and Responders can see it. It moves to En route when a unit sets off.')}</p>
+            <p className="rpl-success-body">{t('Coordinators and Responders can see it. It moves to On route when a unit sets off.')}</p>
           </div>
         </div>
       </section>

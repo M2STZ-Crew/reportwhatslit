@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 
 import { api } from '../../api/client.js';
 import FormDialog from '../ui/FormDialog.jsx';
+import Select from '../ui/Select.jsx';
 import { t } from '../../i18n/i18n.jsx';
 
 /* Create a Coordinator account (REPLIT (MAIN) 10 · A49 875:7435; PRD v13
@@ -16,7 +17,7 @@ import { t } from '../../i18n/i18n.jsx';
  * password passes through the console. `organizations`, when given, is for
  * the system Admin, which belongs to no organisation and names one.
  * With `responder`, the same form makes a Responder (v1.12.49; POST
- * /admin/responders) and asks for a mobile too.
+ * /admin/responders). Both ask for a mobile (v1.12.51).
  * `onCreate({ firstName, lastName, personalEmail, title, mobile, organizationId })`
  * must resolve once the account exists; a rejected promise shows its message
  * in the dialog. */
@@ -112,14 +113,16 @@ export default function CreateCoordinatorDialog({ open, organization, organizati
       busyLabel={t('Creating…')}
     >
       {picking && (
-        <label className="rpl-field">
-          <span className="rpl-field-label">{t('Organization')}</span>
-          <select value={organizationId} onChange={(e) => setOrganizationId(e.target.value)} aria-invalid={!!orgError} disabled={busy}>
-            <option value="">{t('Choose…')}</option>
-            {organizations.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
-          </select>
-          {orgError && <span className="rpl-field-error">{orgError}</span>}
-        </label>
+        <Select
+          variant="field"
+          label={t('Organization')}
+          value={organizationId}
+          onChange={setOrganizationId}
+          placeholder={t('Choose…')}
+          options={organizations.map((o) => ({ key: o.id, label: o.name }))}
+          error={orgError}
+          disabled={busy}
+        />
       )}
       <label className="rpl-field">
         <span className="rpl-field-label">{t('First name')}</span>
@@ -147,12 +150,10 @@ export default function CreateCoordinatorDialog({ open, organization, organizati
         <span className="rpl-field-label">{t('Title (optional)')}</span>
         <input value={title} onChange={(e) => setTitle(e.target.value)} disabled={busy} placeholder={responder ? t('e.g. Nozzleman') : t('e.g. Lieutenant')} maxLength={80} />
       </label>
-      {responder && (
-        <label className="rpl-field">
-          <span className="rpl-field-label">{t('Mobile (optional)')}</span>
-          <input type="tel" value={mobile} onChange={(e) => setMobile(e.target.value)} disabled={busy} autoComplete="off" placeholder="0917 123 4567" maxLength={32} />
-        </label>
-      )}
+      <label className="rpl-field">
+        <span className="rpl-field-label">{t('Mobile (optional)')}</span>
+        <input type="tel" value={mobile} onChange={(e) => setMobile(e.target.value)} disabled={busy} autoComplete="off" placeholder="0917 123 4567" maxLength={32} />
+      </label>
     </FormDialog>
   );
 }

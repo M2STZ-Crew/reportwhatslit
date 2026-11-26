@@ -1,24 +1,35 @@
 import { useEffect, useState } from 'react';
 
 import FormDialog from '../ui/FormDialog.jsx';
+import Select from '../ui/Select.jsx';
 import { t } from '../../i18n/i18n.jsx';
 
-/* An Admin's forms for a responder's account (v1.12.49; 22 Nov 2026: "admin
- * can manage responders too"; answered "Full account control" and "Own org;
- * hub manages all"). The server checks every rule again
- * (app/api/routes/admin_responders.py). */
+/* An Admin's forms for a staff account, a Responder's (v1.12.49; 22 Nov
+ * 2026: "admin can manage responders too"; answered "Full account control"
+ * and "Own org; hub manages all") or a Coordinator's (v1.12.51; 23 Nov 2026:
+ * "make the account management in coordinator and responder the same"). The
+ * server checks every rule again (app/services/staff_admin.py). */
 
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const STAFF_DOMAIN = /@replit\.com$/i;
 
 const nameOf = (person) => person?.full_name || person?.email || '';
 const orgOf = (person) => person?.org || t('No organization');
+const isCoordinator = (person) => person?.role === 'sub_admin';
 
-/* Manage a responder: name, title and mobile, and the ways to their sign-in
+/* "Coordinator · Pasay Fire Volunteers", over each form about one account. */
+export function accountEyebrow(person) {
+  if (!person) return '';
+  return isCoordinator(person)
+    ? t('Coordinator · {org}', { org: orgOf(person) })
+    : t('Responder · {org}', { org: orgOf(person) });
+}
+
+/* Manage an account: name, title and mobile, and the ways to their sign-in
  * (a password link, off and on). With `organizations` (the central hub and the
  * system Admin), the organization too: one of the same agency, and not while
  * they are on a fire. Only what changed is sent. */
-export function ManageResponderDialog({
+export function ManageAccountDialog({
   person, organizations = null, onSave, onLink, onTurnOff, onTurnOn, onClose,
 }) {
   const [name, setName] = useState('');
@@ -72,7 +83,7 @@ export function ManageResponderDialog({
   return (
     <FormDialog
       open={Boolean(person)}
-      eyebrow={person ? t('Responder · {org}', { org: orgOf(person) }) : ''}
+      eyebrow={accountEyebrow(person)}
       title={person ? t('Manage {name}', { name: nameOf(person) }) : ''}
       onClose={onClose}
       onSubmit={submit}
@@ -93,25 +104,27 @@ export function ManageResponderDialog({
       </label>
       <label className="rpl-field">
         <span className="rpl-field-label">{t('Title (optional)')}</span>
-        <input value={title} onChange={(e) => setTitle(e.target.value)} disabled={busy || !orgId} placeholder={t('e.g. Nozzleman')} maxLength={80} />
+        <input value={title} onChange={(e) => setTitle(e.target.value)} disabled={busy || !orgId} placeholder={isCoordinator(person) ? t('e.g. Lieutenant') : t('e.g. Nozzleman')} maxLength={80} />
       </label>
       <label className="rpl-field">
         <span className="rpl-field-label">{t('Mobile (optional)')}</span>
         <input type="tel" value={mobile} onChange={(e) => setMobile(e.target.value)} disabled={busy} autoComplete="off" placeholder="0917 123 4567" maxLength={32} />
       </label>
       {movable && (
-        <label className="rpl-field">
-          <span className="rpl-field-label">{t('Organization')}</span>
-          <select value={orgId} onChange={(e) => setOrgId(e.target.value)} disabled={busy || person?.responding}>
-            {!person?.orgId && <option value="">{t('No organization')}</option>}
-            {choices.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
-          </select>
-          <span className="rpl-field-help">
-            {person?.responding
-              ? t('They’re on a fire. You can move them once their response ends.')
-              : t('They can move to another organization of the same agency.')}
-          </span>
-        </label>
+        <Select
+          variant="field"
+          label={t('Organization')}
+          value={orgId}
+          onChange={setOrgId}
+          options={[
+            ...(person?.orgId ? [] : [{ key: '', label: t('No organization') }]),
+            ...choices.map((o) => ({ key: o.id, label: o.name })),
+          ]}
+          disabled={busy || Boolean(person?.responding)}
+          help={person?.responding
+            ? t('They’re on a fire. You can move them once their response ends.')
+            : t('They can move to another organization of the same agency.')}
+        />
       )}
       <fieldset className="rpl-field rpl-account-signin" disabled={busy || changed}>
         <legend className="rpl-field-label">{t('Sign-in')}</legend>
@@ -174,7 +187,7 @@ export function PasswordLinkDialog({ person, onSend, onClose }) {
   return (
     <FormDialog
       open={Boolean(person)}
-      eyebrow={person ? t('Responder · {org}', { org: orgOf(person) }) : ''}
+      eyebrow={accountEyebrow(person)}
       title={person ? t('Send {name} a password link?', { name: nameOf(person) }) : ''}
       onClose={onClose}
       onSubmit={submit}

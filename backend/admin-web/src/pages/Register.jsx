@@ -26,6 +26,11 @@ function equipmentLabel(type) {
   }[type] ?? type;
 }
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
+// As the server takes them (app/schemas/affiliate.py).
+const MAX_ROSTER = 200;
+const MAX_EQUIPMENT = 100;
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const STAFF_DOMAIN = /@replit\.com$/i;
 
 function megabytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(bytes < 1024 * 1024 ? 2 : 1)} MB`;
@@ -76,6 +81,8 @@ export default function Register() {
   const fileRef = useRef(null);
 
   const [orgName, setOrgName] = useState('');
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
   const [agencyType, setAgencyType] = useState('');
   const [phone, setPhone] = useState('');
   const [email, setEmail] = useState('');
@@ -88,6 +95,7 @@ export default function Register() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [done, setDone] = useState(false);
+  const [certFailed, setCertFailed] = useState(false);
 
   function setMember(i, key, val) {
     setRoster((r) => r.map((m, idx) => (idx === i ? { ...m, [key]: val } : m)));
@@ -112,17 +120,22 @@ export default function Register() {
     if (busy) return;
     if (!orgName.trim()) return setError(t('Enter your organization’s name.'));
     if (!agencyType) return setError(t('Choose the type of organization.'));
+    if (!firstName.trim() || !lastName.trim()) return setError(t('Enter your first name and surname.'));
     if (!email.trim()) return setError(t('Enter the email we should reply to.'));
+    if (!EMAIL.test(email.trim())) return setError(t('Enter an email address like name@example.com.'));
+    if (STAFF_DOMAIN.test(email.trim())) return setError(t('Use your own email: @replit.com addresses have no mailbox.'));
     if (!secFile) return setError(t('Attach your SEC certificate.'));
     if (!agree) return setError(t('Agree to the Terms and Agreements to submit.'));
 
     setBusy(true);
     setError(null);
     try {
-      await api.registerAffiliate({
+      const made = await api.registerAffiliate({
         organization_name: orgName.trim(),
         agency_type: agencyType,
         contact_email: email.trim(),
+        contact_first_name: firstName.trim(),
+        contact_last_name: lastName.trim(),
         contact_phone: phone.trim() || null,
         address: address.trim() || null,
         roster: roster
@@ -131,8 +144,16 @@ export default function Register() {
         equipment: equipment
           .filter((u) => u.name.trim())
           .map((u) => ({ name: u.name.trim(), type: u.type || null })),
-        sec_certificate_name: secFile.name,
+        sec_certificate_name: secFile.name.slice(0, 300),
       });
+      // The certificate itself, privately (v1.12.53). The application is
+      // in either way; the hub asks for the file if it did not arrive.
+      try {
+        if (made?.certificate_upload_token) await api.uploadAffiliateCertificate(made.id, made.certificate_upload_token, secFile);
+        else setCertFailed(true);
+      } catch {
+        setCertFailed(true);
+      }
       setDone(true);
     } catch (err) {
       setError(err.message || t('The application could not be sent. Try again.'));
@@ -156,8 +177,10 @@ export default function Register() {
 
             <div className="lg-note rg-done-note">
               <MailIcon />
-              <span>{t('A confirmation is on its way to')}{' '}<strong>{email.trim()}</strong>{t('. Once an admin approves the application, a second email there will have a link to set your password. Check your spam folder if either is not in your inbox.')}</span>
+              <span>{t('A confirmation is on its way to')}{' '}<strong>{email.trim()}</strong>{t('. Once an admin approves the application, a second email there will have your Coordinator sign-in and a link to set its password. Check your spam folder if either is not in your inbox.')}</span>
             </div>
+
+            {certFailed && <div className="lg-error" role="status">{t('Your certificate didn’t upload. The central hub will ask you for it.')}</div>}
 
             <button type="button" className="lg-submit" onClick={() => navigate('/login')}>{t('Back to sign in')}</button>
           </div>
@@ -175,7 +198,7 @@ export default function Register() {
           <div className="lg-head">
             <span className="lg-kicker">{t('Join RepLiT · Pasay City')}</span>
             <h2 className="lg-title">{t('Request to join as an organization')}</h2>
-            <p className="lg-sub">{t('Tell us who you are and what you bring to a fire. No account is needed to apply; we email you once an admin has decided.')}</p>
+            <p className="lg-sub">{t('Tell us who you are and what you bring to a fire. No account is needed to apply. If an admin accepts you, we email your sign-in.')}</p>
           </div>
 
           {/* Organisation ------------------------------------------------ */}
@@ -187,6 +210,7 @@ export default function Register() {
               <input
                 autoComplete="organization"
                 placeholder={t('e.g. Barangay Fire Brigade')}
+                maxLength={200}
                 value={orgName}
                 onChange={(e) => setOrgName(e.target.value)}
               />
@@ -212,11 +236,34 @@ export default function Register() {
                   type="tel"
                   autoComplete="tel"
                   placeholder="09XX XXX XXXX"
+                  maxLength={40}
                   value={phone}
                   onChange={(e) => setPhone(e.target.value)}
                 />
               </label>
             </div>
+
+            <div className="rg-pair">
+              <label className="lg-field">
+                <Label required>{t('Your first name')}</Label>
+                <input
+                  autoComplete="given-name"
+                  maxLength={60}
+                  value={firstName}
+                  onChange={(e) => setFirstName(e.target.value)}
+                />
+              </label>
+              <label className="lg-field">
+                <Label required>{t('Your surname')}</Label>
+                <input
+                  autoComplete="family-name"
+                  maxLength={60}
+                  value={lastName}
+                  onChange={(e) => setLastName(e.target.value)}
+                />
+              </label>
+            </div>
+            <p className="rg-hint">{t('You become your organization’s first Coordinator. Your sign-in is made from your name.')}</p>
 
             <label className="lg-field">
               <Label required>{t('Email')}</Label>
@@ -235,6 +282,7 @@ export default function Register() {
               <input
                 autoComplete="street-address"
                 placeholder={t('Street, barangay, city')}
+                maxLength={500}
                 value={address}
                 onChange={(e) => setAddress(e.target.value)}
               />
@@ -254,7 +302,7 @@ export default function Register() {
                 <span className="rg-upload-icon"><UploadIcon /></span>
                 <span className="rg-upload-text">
                   <span className="rg-upload-name">
-                    {secFile ? secFile.name : t('Upload a PDF or an image')}
+                    {secFile ? secFile.name : t('Choose a PDF or an image')}
                   </span>
                   <span className="rg-upload-meta">
                     {secFile ? t('{megabytes} · Click to replace', { megabytes: megabytes(secFile.size) }) : t('Up to 10 MB')}
@@ -262,6 +310,7 @@ export default function Register() {
                 </span>
               </button>
               <input ref={fileRef} type="file" accept=".pdf,image/*" hidden onChange={onFile} />
+              <span className="rg-hint">{t('Only the central hub can open it.')}</span>
             </div>
           </section>
 
@@ -272,6 +321,7 @@ export default function Register() {
               <button
                 type="button"
                 className="rg-add"
+                disabled={roster.length >= MAX_ROSTER}
                 onClick={() => setRoster((r) => [...r, { full_name: '', role: '' }])}
               >{t('+ Add member')}</button>
             </div>
@@ -284,6 +334,7 @@ export default function Register() {
                     <input
                       aria-label={t('Member {n} full name', { n: i + 1 })}
                       placeholder={t('Full name')}
+                      maxLength={200}
                       value={m.full_name}
                       onChange={(e) => setMember(i, 'full_name', e.target.value)}
                     />
@@ -292,6 +343,7 @@ export default function Register() {
                     <input
                       aria-label={t('Member {n} role', { n: i + 1 })}
                       placeholder={t('Role, e.g. Driver')}
+                      maxLength={120}
                       value={m.role}
                       onChange={(e) => setMember(i, 'role', e.target.value)}
                     />
@@ -317,6 +369,7 @@ export default function Register() {
               <button
                 type="button"
                 className="rg-add"
+                disabled={equipment.length >= MAX_EQUIPMENT}
                 onClick={() => setEquipment((e) => [...e, { name: '', type: '' }])}
               >{t('+ Add unit')}</button>
             </div>
@@ -329,6 +382,7 @@ export default function Register() {
                     <input
                       aria-label={t('Unit {n} name', { n: i + 1 })}
                       placeholder={t('Name or plate, e.g. Engine 1')}
+                      maxLength={200}
                       value={u.name}
                       onChange={(e) => setUnit(i, 'name', e.target.value)}
                     />
@@ -364,7 +418,10 @@ export default function Register() {
             <input type="checkbox" checked={agree} onChange={(e) => setAgree(e.target.checked)} />
             <span>{t('I agree to the Terms and Agreements and acknowledge the privacy policy on sensitive emergency data.')}</span>
           </label>
-          <a className="lg-link" href="https://reportwhatslit-app.vercel.app/privacy" target="_blank" rel="noopener">{t('Read the privacy policy')}</a>
+          <span className="rg-links">
+            <a className="lg-link" href="https://reportwhatslit-app.vercel.app/terms" target="_blank" rel="noopener">{t('Read the Terms')}</a>
+            <a className="lg-link" href="https://reportwhatslit-app.vercel.app/privacy" target="_blank" rel="noopener">{t('Read the privacy policy')}</a>
+          </span>
 
           {error && <div className="lg-error" role="alert">{error}</div>}
 

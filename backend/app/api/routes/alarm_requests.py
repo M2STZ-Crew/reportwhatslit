@@ -69,7 +69,7 @@ from app.services import fire_broadcast
 from app.services.access import DECIDE_ALARM, REQUEST_ALARM, admin_access
 from app.services.alarm_notify import notify_alarm_raised
 from app.services.audit import record_audit
-from app.services.incident import OFF_FEED_STATUSES, assert_admin_routed
+from app.services.incident import OFF_FEED_STATUSES, assert_admin_routed, assert_org_going
 from app.services.incident_notify import (
     notify_alarm_request_answered,
     notify_bfp_alarm_request,
@@ -126,6 +126,18 @@ async def _alert_everyone(
 def _rank(level: str | None) -> int:
     """Where a level sits on the ladder; no level yet is below all of them."""
     return _LADDER.index(level) if level in _LADDER else -1
+
+
+def _assert_fire_type_known(area: Any) -> None:
+    """No alarm before somebody on scene says what is burning (v1.12.52; 23 Nov
+    2026: "they can't raise an alarm level if someone isn't fill-up the fire
+    type first"). A 409 ``fire_type_first``: asking, raising and approving."""
+    if area.get("fire_type") is None:
+        raise ConflictError(
+            f"{_area_name(area['designation'])} has no fire type yet. The alarm can "
+            "be raised once the first fire team on scene says what is burning.",
+            error_code="fire_type_first",
+        )
 
 
 def _area_name(designation: Any) -> str:
@@ -243,6 +255,7 @@ async def create_alarm_request(
             "Coordinators, may ask for an alarm escalation."
         )
     await assert_admin_routed(db, payload.area_id, user, "ask BFP to raise its alarm")
+    await assert_org_going(db, payload.area_id, user, "ask BFP to raise its alarm")
     level = payload.requested_alarm_level
     # A refusal in words rather than a 422: an older app still offers this level.
     if level == INITIAL_ALARM_LEVEL:
@@ -260,12 +273,14 @@ async def create_alarm_request(
             f"alarm-request:{payload.area_id}:{user.id}",
         )
         area = await conn.fetchrow(
-            "select status::text as status, alarm_level::text as alarm_level, designation "
+            "select status::text as status, alarm_level::text as alarm_level, "
+            "designation, fire_type "
             "from public.areas where id = $1",
             payload.area_id,
         )
         if area is None:
             raise NotFoundError("Incident (area) not found.")
+        _assert_fire_type_known(area)
         if area["status"] in OFF_FEED_STATUSES:
             raise ConflictError("Cannot raise an alarm on a closed incident.")
         if _rank(level) <= _rank(area["alarm_level"]):
@@ -447,12 +462,14 @@ async def raise_alarm(
         )
     async with db.acquire() as conn, conn.transaction():
         area = await conn.fetchrow(
-            "select status::text as status, alarm_level::text as alarm_level, designation "
+            "select status::text as status, alarm_level::text as alarm_level, "
+            "designation, fire_type "
             "from public.areas where id = $1 for update",
             payload.area_id,
         )
         if area is None:
             raise NotFoundError("Incident (area) not found.")
+        _assert_fire_type_known(area)
         if area["status"] in OFF_FEED_STATUSES:
             raise ConflictError(
                 f"{_area_name(area['designation'])} has ended, so its alarm level stays "
@@ -592,12 +609,14 @@ async def execute_alarm_request(
         if req["status"] != "pending":
             raise ConflictError("This alarm escalation has already been reviewed.")
         area = await conn.fetchrow(
-            "select status::text as status, alarm_level::text as alarm_level, designation "
+            "select status::text as status, alarm_level::text as alarm_level, "
+            "designation, fire_type "
             "from public.areas where id = $1 for update",
             req["area_id"],
         )
         if area is None:
             raise NotFoundError("Incident (area) not found.")
+        _assert_fire_type_known(area)
         if area["status"] in OFF_FEED_STATUSES:
             raise ConflictError(
                 f"{_area_name(area['designation'])} has ended, so its alarm level stays "

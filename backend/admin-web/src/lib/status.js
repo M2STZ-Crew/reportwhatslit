@@ -3,7 +3,7 @@ import { t } from '../i18n/i18n.jsx';
 ///
 /// v11 renames the operator-facing set (Section 2.5) and drops 'dispatched':
 /// v12: Accept verifies (Reported -> Verified); the first responder moves it to
-/// En route. Either way there
+/// On route. Either way there
 /// is no step between the two to label. 'post_incident_report' is the wait
 /// between fire out and the team captain filing; 'closed' is terminal.
 /// Pass 6 (REPLIT (MAIN) 04 · Lifecycle chip; PRD v13 §4.5.1, §19.2): the
@@ -13,11 +13,13 @@ import { t } from '../i18n/i18n.jsx';
 /// day the server sends them. A person's identity "Verified" badge is a
 /// different thing and keeps its word.
 export const STATUS = {
-  reported: { get label() { return t('Reported'); }, color: '#FFB020' },
+  // 22 Nov 2026 (v1.12.50): "palitan yung 'Reported' to 'To Acknowledge'".
+  // The console's word; residents still read Reported.
+  reported: { get label() { return t('To acknowledge'); }, color: '#FFB020' },
   verified: { get label() { return t('Acknowledged'); }, color: '#5B93F5' },
   acknowledged: { get label() { return t('Acknowledged'); }, color: '#5B93F5' },
   declined: { get label() { return t('Declined'); }, color: '#9E9E9E' },
-  en_route: { get label() { return t('En route'); }, color: '#FF9066' },
+  en_route: { get label() { return t('On route'); }, color: '#FF9066' },
   arrived: { get label() { return t('Arrived'); }, color: '#FF544E' },
   fire_out: { get label() { return t('Fire out'); }, color: '#22C55E' },
   post_incident_report: { get label() { return t('Report due'); }, color: '#2DD4BF' },
@@ -39,6 +41,17 @@ export const AGENCY_LABEL = {
   get police() { return t('Police'); },
   get medical() { return t('Medical'); },
   get barangay() { return t('Barangay'); },
+};
+
+/* What is burning, as the first fire team on scene said (v1.12.37): the
+ * server's values (app/services/fire_type.py). */
+export const FIRE_TYPE = {
+  get structural() { return t('Structural'); },
+  get electrical() { return t('Electrical'); },
+  get vehicular() { return t('Vehicular'); },
+  get rubbish() { return t('Rubbish'); },
+  get grass() { return t('Grass'); },
+  get chemical() { return t('Chemical'); },
 };
 
 /// v11 removed Admin's manual routing (§2.6.2), and routableAgencies with it:
